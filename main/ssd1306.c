@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <ctype.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -38,7 +39,10 @@ static const uint8_t UNKNOWN_16X16[32] = {
 
 static const uint8_t FONT_5X7[][5] = {
     [' ' - ' '] = {0x00, 0x00, 0x00, 0x00, 0x00},
+    ['%' - ' '] = {0x23, 0x13, 0x08, 0x64, 0x62},
     ['-' - ' '] = {0x08, 0x08, 0x08, 0x08, 0x08},
+    ['.' - ' '] = {0x00, 0x60, 0x60, 0x00, 0x00},
+    ['/' - ' '] = {0x20, 0x10, 0x08, 0x04, 0x02},
     ['0' - ' '] = {0x3E, 0x51, 0x49, 0x45, 0x3E},
     ['1' - ' '] = {0x00, 0x42, 0x7F, 0x40, 0x00},
     ['2' - ' '] = {0x42, 0x61, 0x51, 0x49, 0x46},
@@ -49,6 +53,7 @@ static const uint8_t FONT_5X7[][5] = {
     ['7' - ' '] = {0x01, 0x71, 0x09, 0x05, 0x03},
     ['8' - ' '] = {0x36, 0x49, 0x49, 0x49, 0x36},
     ['9' - ' '] = {0x06, 0x49, 0x49, 0x29, 0x1E},
+    [':' - ' '] = {0x00, 0x36, 0x36, 0x00, 0x00},
     ['A' - ' '] = {0x7E, 0x11, 0x11, 0x11, 0x7E},
     ['B' - ' '] = {0x7F, 0x49, 0x49, 0x49, 0x36},
     ['C' - ' '] = {0x3E, 0x41, 0x41, 0x41, 0x22},
@@ -75,6 +80,25 @@ static const uint8_t FONT_5X7[][5] = {
     ['X' - ' '] = {0x63, 0x14, 0x08, 0x14, 0x63},
     ['Y' - ' '] = {0x07, 0x08, 0x70, 0x08, 0x07},
     ['Z' - ' '] = {0x61, 0x51, 0x49, 0x45, 0x43},
+};
+
+static const char * const BLUETOOTH_ICON_16[] = {
+    ".......#........",
+    ".......##.......",
+    ".......#.#......",
+    "...#...#..#.....",
+    "....#..#.#......",
+    ".....#.#........",
+    "......##........",
+    ".......#........",
+    "......##........",
+    ".....#.#........",
+    "....#..#.#......",
+    "...#...#..#.....",
+    ".......#.#......",
+    ".......##.......",
+    ".......#........",
+    "................",
 };
 
 static esp_err_t ssd1306_write(const uint8_t *data, size_t len)
@@ -119,6 +143,46 @@ static const uint8_t *font_for_char(char c)
     }
 
     return glyph;
+}
+
+static void draw_pixel(int x, int y, bool on)
+{
+    if (x < 0 || x >= OLED_WIDTH || y < 0 || y >= OLED_HEIGHT) {
+        return;
+    }
+
+    uint8_t *cell = &s_framebuf[(y / 8) * OLED_WIDTH + x];
+    uint8_t mask = 1U << (y % 8);
+    if (on) {
+        *cell |= mask;
+    } else {
+        *cell &= (uint8_t)~mask;
+    }
+}
+
+static void draw_line(int x0, int y0, int x1, int y1)
+{
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = y1 > y0 ? y0 - y1 : y1 - y0;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+
+    while (true) {
+        draw_pixel(x0, y0, true);
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
 }
 
 static bool decode_utf8(const char *text, uint32_t *codepoint, size_t *bytes)
@@ -410,6 +474,120 @@ esp_err_t ssd1306_draw_text16(int page, int col, const char *text)
         }
 
         text += consumed;
+    }
+
+    return ESP_OK;
+}
+
+static void draw_glyph16_scaled24(int y0, int col, const uint8_t glyph[32])
+{
+    for (int dy = 0; dy < 24; dy++) {
+        int sy = dy * 16 / 24;
+        for (int dx = 0; dx < 24; dx++) {
+            int sx = dx * 16 / 24;
+            bool on = (glyph[sx * 2 + sy / 8] & (1U << (sy % 8))) != 0;
+            draw_pixel(col + dx, y0 + dy, on);
+        }
+    }
+}
+
+esp_err_t ssd1306_draw_text24(int y, int col, const char *text)
+{
+    if (text == NULL || y < 0 || y + 24 > OLED_HEIGHT || col < 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    while (*text != '\0' && col < OLED_WIDTH) {
+        uint32_t codepoint = 0;
+        size_t consumed = 1;
+
+        if (!decode_utf8(text, &codepoint, &consumed)) {
+            codepoint = 0;
+        }
+
+        if (codepoint >= 0x80) {
+            if (col + 24 > OLED_WIDTH) {
+                break;
+            }
+
+            uint16_t gb = 0;
+            const uint8_t *glyph = unicode_to_gb2312(codepoint, &gb) ? gb2312_glyph(gb) : UNKNOWN_16X16;
+            draw_glyph16_scaled24(y, col, glyph);
+            col += 24;
+        } else {
+            col += 12;
+        }
+
+        text += consumed;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t ssd1306_draw_bluetooth_icon(int page, int col, bool connected)
+{
+    if (page < 0 || page + 1 >= OLED_HEIGHT / 8 || col < 0 || col + 16 > OLED_WIDTH) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int y0 = page * 8;
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            draw_pixel(col + x, y0 + y, false);
+        }
+    }
+
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            if (BLUETOOTH_ICON_16[y][x] == '#') {
+                draw_pixel(col + x, y0 + y, true);
+            }
+        }
+    }
+
+    if (!connected) {
+        draw_line(col + 2, y0 + 14, col + 14, y0 + 2);
+        draw_line(col + 3, y0 + 14, col + 14, y0 + 3);
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t ssd1306_draw_battery_icon(int page, int col, uint8_t percent)
+{
+    if (page < 0 || page + 1 >= OLED_HEIGHT / 8 || col < 0 || col + 16 > OLED_WIDTH) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (percent > 100) {
+        percent = 100;
+    }
+
+    int y0 = page * 8;
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            draw_pixel(col + x, y0 + y, false);
+        }
+    }
+
+    // Body: 12x10 plus 2px positive terminal.
+    for (int x = 0; x <= 11; x++) {
+        draw_pixel(col + x, y0 + 3, true);
+        draw_pixel(col + x, y0 + 12, true);
+    }
+    for (int y = 3; y <= 12; y++) {
+        draw_pixel(col, y0 + y, true);
+        draw_pixel(col + 11, y0 + y, true);
+    }
+    for (int y = 6; y <= 9; y++) {
+        draw_pixel(col + 12, y0 + y, true);
+        draw_pixel(col + 13, y0 + y, true);
+    }
+
+    uint8_t fill_cols = (uint8_t)((percent * 8 + 50) / 100);
+    for (int x = 0; x < fill_cols; x++) {
+        for (int y = 5; y <= 10; y++) {
+            draw_pixel(col + 2 + x, y0 + y, true);
+        }
     }
 
     return ESP_OK;

@@ -7,6 +7,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 
+#include "battery_adc.h"
 #include "esp_bt.h"
 #include "esp_bt_defs.h"
 #include "esp_bt_main.h"
@@ -17,16 +18,22 @@
 #include "esp_hidd.h"
 #include "esp_hidd_gatts.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#define BLE_HID_KEYBOARD_MAP_INDEX 0
-#define BLE_HID_MOUSE_MAP_INDEX 1
+#define BLE_HID_REPORT_MAP_INDEX 0
 #define BLE_HID_KEYBOARD_REPORT_ID 1
 #define BLE_HID_MOUSE_REPORT_ID 2
-#define BLE_HID_DRAG_STEPS 20
+#define BLE_HID_CONSUMER_REPORT_ID 3
+#define BLE_HID_DRAG_STEPS 5
+#define BLE_HID_BATTERY_FIRST_NOTIFY_MS 1000
+#define BLE_HID_BATTERY_NOTIFY_INTERVAL_MS 60000
+#define BLE_HID_DEVICE_NVS_NAMESPACE "bledev"
+#define BLE_HID_DEVICE_NVS_CURRENT "current"
+#define BLE_HID_DIRECT_ADV_MS 5000
 
 static const char *TAG = "ble_hid";
 static const char *DEVICE_NAME = "ESP32-HID";
@@ -36,14 +43,23 @@ static bool s_connected;
 static bool s_advertising;
 static bool s_adv_config_done;
 static bool s_scan_rsp_config_done;
+static bool s_allow_auto_advertise;
+static bool s_pairing_discoverable;
+static bool s_direct_connect_pending;
+static uint8_t s_selected_device_slot;
+static ble_hid_device_slot_t s_device_slots[BLE_HID_DEVICE_SLOT_COUNT];
+static esp_bd_addr_t s_connected_bda;
 static char s_connected_addr[18]; // "XX:XX:XX:XX:XX:XX"
+static TaskHandle_t s_battery_task;
+static TickType_t s_next_battery_notify_tick;
+static uint8_t s_last_battery_level;
 
 static uint8_t s_hid_service_uuid[] = {
     0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
     0x00, 0x10, 0x00, 0x00, 0x12, 0x18, 0x00, 0x00,
 };
 
-static const uint8_t HID_KEYBOARD_REPORT_MAP[] = {
+static const uint8_t HID_REPORT_MAP[] = {
     0x05, 0x01,       // Usage Page (Generic Desktop)
     0x09, 0x06,       // Usage (Keyboard)
     0xA1, 0x01,       // Collection (Application)
@@ -68,9 +84,7 @@ static const uint8_t HID_KEYBOARD_REPORT_MAP[] = {
     0x29, 0x65,
     0x81, 0x00,       // Input (6 key array)
     0xC0,             // End Collection
-};
 
-static const uint8_t HID_MOUSE_REPORT_MAP[] = {
     0x05, 0x01,       // Usage Page (Generic Desktop)
     0x09, 0x02,       // Usage (Mouse)
     0xA1, 0x01,       // Collection (Application)
@@ -108,17 +122,26 @@ static const uint8_t HID_MOUSE_REPORT_MAP[] = {
     0x95, 0x01,       // Report Count (1)
     0x81, 0x06,       // Input (Data, Var, Rel)
     0xC0,             // End Physical Collection
+    0xC0,             // End Application Collection
+
+    0x05, 0x0C,       // Usage Page (Consumer)
+    0x09, 0x01,       // Usage (Consumer Control)
+    0xA1, 0x01,       // Collection (Application)
+    0x85, BLE_HID_CONSUMER_REPORT_ID,
+    0x15, 0x00,       // Logical Minimum (0)
+    0x26, 0xFF, 0x03, // Logical Maximum (0x03FF)
+    0x19, 0x00,       // Usage Minimum (0)
+    0x2A, 0xFF, 0x03, // Usage Maximum (0x03FF)
+    0x75, 0x10,       // Report Size (16)
+    0x95, 0x01,       // Report Count (1)
+    0x81, 0x00,       // Input (Data, Array, Abs)
     0xC0              // End Application Collection
 };
 
 static esp_hid_raw_report_map_t s_hid_report_maps[] = {
     {
-        .data = HID_KEYBOARD_REPORT_MAP,
-        .len = sizeof(HID_KEYBOARD_REPORT_MAP),
-    },
-    {
-        .data = HID_MOUSE_REPORT_MAP,
-        .len = sizeof(HID_MOUSE_REPORT_MAP),
+        .data = HID_REPORT_MAP,
+        .len = sizeof(HID_REPORT_MAP),
     },
 };
 
@@ -130,7 +153,7 @@ static esp_hid_device_config_t s_hid_config = {
     .manufacturer_name = "ESP32",
     .serial_number = "0001",
     .report_maps = s_hid_report_maps,
-    .report_maps_len = 2,
+    .report_maps_len = 1,
 };
 
 static esp_ble_adv_data_t s_adv_data = {
@@ -164,10 +187,202 @@ static esp_ble_adv_params_t s_adv_params = {
     .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
 
+static esp_ble_adv_params_t s_direct_adv_params = {
+    .adv_int_min = 0x20,
+    .adv_int_max = 0x30,
+    .adv_type = ADV_TYPE_DIRECT_IND_LOW,
+    .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+    .peer_addr_type = BLE_ADDR_TYPE_PUBLIC,
+    .channel_map = ADV_CHNL_ALL,
+    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+};
+
+static char slot_key(uint8_t slot)
+{
+    return (char)('0' + slot);
+}
+
+static void load_device_slots(void)
+{
+    nvs_handle_t h;
+    memset(s_device_slots, 0, sizeof(s_device_slots));
+    s_selected_device_slot = 0;
+
+    if (nvs_open(BLE_HID_DEVICE_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+
+    nvs_get_u8(h, BLE_HID_DEVICE_NVS_CURRENT, &s_selected_device_slot);
+    if (s_selected_device_slot >= BLE_HID_DEVICE_SLOT_COUNT) {
+        s_selected_device_slot = 0;
+    }
+
+    for (uint8_t i = 0; i < BLE_HID_DEVICE_SLOT_COUNT; i++) {
+        char key[6] = {'s', 'l', 'o', 't', slot_key(i), '\0'};
+        size_t len = sizeof(s_device_slots[i]);
+        nvs_get_blob(h, key, &s_device_slots[i], &len);
+        if (len != sizeof(s_device_slots[i])) {
+            memset(&s_device_slots[i], 0, sizeof(s_device_slots[i]));
+        }
+    }
+
+    nvs_close(h);
+}
+
+static void save_selected_slot(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(BLE_HID_DEVICE_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, BLE_HID_DEVICE_NVS_CURRENT, s_selected_device_slot);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static void save_device_slot(uint8_t slot)
+{
+    if (slot >= BLE_HID_DEVICE_SLOT_COUNT) {
+        return;
+    }
+
+    nvs_handle_t h;
+    if (nvs_open(BLE_HID_DEVICE_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        char key[6] = {'s', 'l', 'o', 't', slot_key(slot), '\0'};
+        nvs_set_blob(h, key, &s_device_slots[slot], sizeof(s_device_slots[slot]));
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static void remove_bond_for_addr(const uint8_t addr[6])
+{
+    int dev_num = esp_ble_get_bond_device_num();
+    if (dev_num <= 0) {
+        return;
+    }
+
+    esp_ble_bond_dev_t bonds[dev_num];
+    if (esp_ble_get_bond_device_list(&dev_num, bonds) != ESP_OK) {
+        return;
+    }
+
+    for (int i = 0; i < dev_num; i++) {
+        if (memcmp(bonds[i].bd_addr, addr, 6) == 0) {
+            esp_ble_remove_bond_device(bonds[i].bd_addr);
+            return;
+        }
+    }
+}
+
+static void stop_advertising_now(void)
+{
+    if (s_advertising) {
+        esp_ble_gap_stop_advertising();
+        s_advertising = false;
+    }
+}
+
+static bool addr_is_selected_slot(const uint8_t addr[6])
+{
+    ble_hid_device_slot_t *slot = &s_device_slots[s_selected_device_slot];
+    return slot->valid && memcmp(slot->addr, addr, 6) == 0;
+}
+
+static bool addr_is_any_slot(const uint8_t addr[6])
+{
+    for (uint8_t i = 0; i < BLE_HID_DEVICE_SLOT_COUNT; i++) {
+        if (s_device_slots[i].valid && memcmp(s_device_slots[i].addr, addr, 6) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool addr_is_other_slot(const uint8_t addr[6])
+{
+    for (uint8_t i = 0; i < BLE_HID_DEVICE_SLOT_COUNT; i++) {
+        if (i != s_selected_device_slot &&
+            s_device_slots[i].valid && memcmp(s_device_slots[i].addr, addr, 6) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool addr_is_allowed_for_security(const uint8_t addr[6])
+{
+    if (addr_is_selected_slot(addr)) {
+        return true;
+    }
+    if (s_pairing_discoverable && !addr_is_other_slot(addr)) {
+        return true;
+    }
+    return false;
+}
+
+static void remove_bonds_not_in_slots(void)
+{
+    int dev_num = esp_ble_get_bond_device_num();
+    if (dev_num <= 0) {
+        return;
+    }
+
+    esp_ble_bond_dev_t bonds[dev_num];
+    if (esp_ble_get_bond_device_list(&dev_num, bonds) != ESP_OK) {
+        return;
+    }
+
+    for (int i = 0; i < dev_num; i++) {
+        if (!addr_is_any_slot(bonds[i].bd_addr)) {
+            esp_ble_remove_bond_device(bonds[i].bd_addr);
+        }
+    }
+}
+
 static void start_advertising_if_ready(void)
 {
-    if (s_adv_config_done && s_scan_rsp_config_done && !s_advertising) {
+    if (s_direct_connect_pending && s_adv_config_done && s_scan_rsp_config_done && !s_advertising) {
+        ble_hid_device_slot_t *slot = &s_device_slots[s_selected_device_slot];
+        if (slot->valid) {
+            memcpy(s_direct_adv_params.peer_addr, slot->addr, 6);
+            s_direct_adv_params.peer_addr_type = (esp_ble_addr_type_t)slot->addr_type;
+            if (esp_ble_gap_start_advertising(&s_direct_adv_params) == ESP_OK) {
+                s_advertising = true;
+            }
+        }
+        s_direct_connect_pending = false;
+        return;
+    }
+
+    if (s_allow_auto_advertise && s_pairing_discoverable && s_adv_config_done && s_scan_rsp_config_done && !s_advertising) {
         esp_ble_gap_start_advertising(&s_adv_params);
+    }
+}
+
+static bool tick_reached(TickType_t now, TickType_t target)
+{
+    return (int32_t)(now - target) >= 0;
+}
+
+static void battery_notify_task(void *arg)
+{
+    (void)arg;
+
+    while (true) {
+        if (s_connected && s_hid_dev != NULL) {
+            TickType_t now = xTaskGetTickCount();
+            if (s_next_battery_notify_tick == 0 || tick_reached(now, s_next_battery_notify_tick)) {
+                int battery_mv = 0;
+                if (battery_adc_read_actual_mv(&battery_mv) == ESP_OK) {
+                    s_last_battery_level = battery_adc_percent_from_mv(battery_mv);
+                }
+                esp_hidd_dev_battery_set(s_hid_dev, s_last_battery_level);
+                ESP_LOGI(TAG, "battery level notified: %u%%", s_last_battery_level);
+                s_next_battery_notify_tick = now + pdMS_TO_TICKS(BLE_HID_BATTERY_NOTIFY_INTERVAL_MS);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -201,9 +416,24 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
         }
         break;
 
+    case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
+        if (param->adv_stop_cmpl.status == ESP_BT_STATUS_SUCCESS) {
+            s_advertising = false;
+            ESP_LOGI(TAG, "advertising stopped");
+        } else {
+            ESP_LOGE(TAG, "advertising stop failed: %d", param->adv_stop_cmpl.status);
+        }
+        break;
+
     case ESP_GAP_BLE_SEC_REQ_EVT:
-        ESP_LOGI(TAG, "security request, responding");
-        esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
+        if (addr_is_allowed_for_security(param->ble_security.ble_req.bd_addr)) {
+            ESP_LOGI(TAG, "security request accepted");
+            esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
+        } else {
+            ESP_LOGW(TAG, "security request rejected");
+            esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, false);
+            esp_ble_gap_disconnect(param->ble_security.ble_req.bd_addr);
+        }
         break;
 
     case ESP_GAP_BLE_PASSKEY_NOTIF_EVT:
@@ -212,7 +442,13 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 
     case ESP_GAP_BLE_AUTH_CMPL_EVT:
         if (param->ble_security.auth_cmpl.success) {
+            if (!addr_is_allowed_for_security(param->ble_security.auth_cmpl.bd_addr)) {
+                ESP_LOGW(TAG, "auth completed for unauthorized device, disconnecting");
+                esp_ble_gap_disconnect(param->ble_security.auth_cmpl.bd_addr);
+                break;
+            }
             ESP_LOGI(TAG, "pairing succeeded");
+            memcpy(s_connected_bda, param->ble_security.auth_cmpl.bd_addr, sizeof(s_connected_bda));
             snprintf(s_connected_addr, sizeof(s_connected_addr),
                      "%02x:%02x:%02x:%02x:%02x:%02x",
                      param->ble_security.auth_cmpl.bd_addr[0],
@@ -222,6 +458,14 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                      param->ble_security.auth_cmpl.bd_addr[4],
                      param->ble_security.auth_cmpl.bd_addr[5]);
             ESP_LOGI(TAG, "connected to: %s", s_connected_addr);
+            if (s_pairing_discoverable) {
+                s_device_slots[s_selected_device_slot].valid = true;
+                memcpy(s_device_slots[s_selected_device_slot].addr, param->ble_security.auth_cmpl.bd_addr, 6);
+                s_device_slots[s_selected_device_slot].addr_type = (uint8_t)param->ble_security.auth_cmpl.addr_type;
+                save_device_slot(s_selected_device_slot);
+                s_pairing_discoverable = false;
+                s_allow_auto_advertise = false;
+            }
         } else {
             ESP_LOGI(TAG, "pairing failed");
         }
@@ -243,16 +487,18 @@ static void hidd_event_callback(void *handler_args, esp_event_base_t base, int32
     case ESP_HIDD_CONNECT_EVENT:
         s_connected = true;
         s_advertising = false;
+        s_next_battery_notify_tick = xTaskGetTickCount() + pdMS_TO_TICKS(BLE_HID_BATTERY_FIRST_NOTIFY_MS);
         ESP_LOGI(TAG, "connected");
-        esp_hidd_dev_battery_set(s_hid_dev, 34);
         break;
 
     case ESP_HIDD_DISCONNECT_EVENT:
         s_connected = false;
         s_advertising = false;
+        s_next_battery_notify_tick = 0;
+        memset(s_connected_bda, 0, sizeof(s_connected_bda));
         s_connected_addr[0] = '\0';
         ESP_LOGI(TAG, "disconnected");
-        esp_ble_gap_start_advertising(&s_adv_params);
+        start_advertising_if_ready();
         break;
 
     default:
@@ -273,6 +519,10 @@ static esp_err_t init_nvs(void)
 esp_err_t ble_hid_init(void)
 {
     ESP_RETURN_ON_ERROR(init_nvs(), TAG, "nvs init failed");
+    load_device_slots();
+    s_allow_auto_advertise = false;
+    s_pairing_discoverable = false;
+    s_direct_connect_pending = s_device_slots[s_selected_device_slot].valid;
 
     esp_err_t event_ret = esp_event_loop_create_default();
     if (event_ret != ESP_OK && event_ret != ESP_ERR_INVALID_STATE) {
@@ -301,10 +551,23 @@ esp_err_t ble_hid_init(void)
     ESP_RETURN_ON_ERROR(esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(key_size)), TAG, "key size param failed");
     ESP_RETURN_ON_ERROR(esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(init_key)), TAG, "init key param failed");
     ESP_RETURN_ON_ERROR(esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(rsp_key)), TAG, "rsp key param failed");
+    remove_bonds_not_in_slots();
 
     ESP_RETURN_ON_ERROR(esp_ble_gap_config_adv_data(&s_adv_data), TAG, "adv data config failed");
     ESP_RETURN_ON_ERROR(esp_ble_gap_config_adv_data(&s_scan_rsp_data), TAG, "scan rsp config failed");
     ESP_RETURN_ON_ERROR(esp_hidd_dev_init(&s_hid_config, ESP_HID_TRANSPORT_BLE, hidd_event_callback, &s_hid_dev), TAG, "hid init failed");
+
+    int battery_mv = 0;
+    if (battery_adc_read_actual_mv(&battery_mv) == ESP_OK) {
+        s_last_battery_level = battery_adc_percent_from_mv(battery_mv);
+    }
+
+    if (s_battery_task == NULL) {
+        BaseType_t task_ret = xTaskCreate(battery_notify_task, "battery_notify", 2048, NULL, 5, &s_battery_task);
+        if (task_ret != pdPASS) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
 
     return ESP_OK;
 }
@@ -321,20 +584,38 @@ const char *ble_hid_get_connected_addr(void)
 
 static esp_err_t send_keyboard_report(uint8_t keycode)
 {
+    return ble_hid_send_key_combo(0, keycode);
+}
+
+esp_err_t ble_hid_send_key_combo(uint8_t modifier, uint8_t keycode)
+{
+    ESP_RETURN_ON_ERROR(ble_hid_keyboard_press(modifier, keycode), TAG, "key press failed");
+    vTaskDelay(pdMS_TO_TICKS(20));
+    return ble_hid_keyboard_release();
+}
+
+esp_err_t ble_hid_keyboard_press(uint8_t modifier, uint8_t keycode)
+{
     if (!s_connected || s_hid_dev == NULL) {
         return ESP_OK;
     }
 
     uint8_t report[8] = {0};
+    report[0] = modifier;
     report[2] = keycode;
 
-    ESP_LOGI(TAG, "keyboard keycode=0x%02x", keycode);
-    ESP_RETURN_ON_ERROR(esp_hidd_dev_input_set(s_hid_dev, BLE_HID_KEYBOARD_MAP_INDEX, BLE_HID_KEYBOARD_REPORT_ID, report, sizeof(report)),
-                        TAG, "key press failed");
+    ESP_LOGI(TAG, "keyboard modifier=0x%02x keycode=0x%02x", modifier, keycode);
+    return esp_hidd_dev_input_set(s_hid_dev, BLE_HID_REPORT_MAP_INDEX, BLE_HID_KEYBOARD_REPORT_ID, report, sizeof(report));
+}
 
-    vTaskDelay(pdMS_TO_TICKS(20));
-    memset(report, 0, sizeof(report));
-    return esp_hidd_dev_input_set(s_hid_dev, BLE_HID_KEYBOARD_MAP_INDEX, BLE_HID_KEYBOARD_REPORT_ID, report, sizeof(report));
+esp_err_t ble_hid_keyboard_release(void)
+{
+    if (!s_connected || s_hid_dev == NULL) {
+        return ESP_OK;
+    }
+
+    uint8_t report[8] = {0};
+    return esp_hidd_dev_input_set(s_hid_dev, BLE_HID_REPORT_MAP_INDEX, BLE_HID_KEYBOARD_REPORT_ID, report, sizeof(report));
 }
 
 esp_err_t ble_hid_send_key(uint8_t keycode)
@@ -344,6 +625,192 @@ esp_err_t ble_hid_send_key(uint8_t keycode)
     }
 
     return send_keyboard_report(keycode);
+}
+
+esp_err_t ble_hid_send_consumer(uint16_t usage)
+{
+    if (usage == 0 || !s_connected || s_hid_dev == NULL) {
+        return ESP_OK;
+    }
+
+    uint8_t report[2] = {
+        (uint8_t)(usage & 0xFF),
+        (uint8_t)(usage >> 8),
+    };
+
+    ESP_LOGI(TAG, "consumer usage=0x%04x", usage);
+    ESP_RETURN_ON_ERROR(esp_hidd_dev_input_set(s_hid_dev, BLE_HID_REPORT_MAP_INDEX, BLE_HID_CONSUMER_REPORT_ID,
+                                               report, sizeof(report)),
+                        TAG, "consumer press failed");
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+    memset(report, 0, sizeof(report));
+    return esp_hidd_dev_input_set(s_hid_dev, BLE_HID_REPORT_MAP_INDEX, BLE_HID_CONSUMER_REPORT_ID,
+                                  report, sizeof(report));
+}
+
+esp_err_t ble_hid_disconnect(void)
+{
+    if (!s_connected) {
+        s_allow_auto_advertise = false;
+        s_pairing_discoverable = false;
+        s_direct_connect_pending = false;
+        stop_advertising_now();
+        ESP_LOGI(TAG, "disconnect ignored (not connected)");
+        return ESP_OK;
+    }
+
+    s_allow_auto_advertise = false;
+    s_pairing_discoverable = false;
+    s_direct_connect_pending = false;
+    esp_err_t ret = esp_ble_gap_disconnect(s_connected_bda);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "disconnect failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    s_connected = false;
+    s_connected_addr[0] = '\0';
+    s_next_battery_notify_tick = 0;
+    memset(s_connected_bda, 0, sizeof(s_connected_bda));
+    ESP_LOGI(TAG, "disconnected by user");
+    return ESP_OK;
+}
+
+esp_err_t ble_hid_enable_connection(void)
+{
+    return ble_hid_connect_selected_device();
+}
+
+esp_err_t ble_hid_select_device_slot(uint8_t slot)
+{
+    if (slot >= BLE_HID_DEVICE_SLOT_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_selected_device_slot = slot;
+    save_selected_slot();
+    ESP_LOGI(TAG, "selected device slot %u", (unsigned)(slot + 1));
+    return ESP_OK;
+}
+
+uint8_t ble_hid_get_selected_device_slot(void)
+{
+    return s_selected_device_slot;
+}
+
+bool ble_hid_get_device_slot(uint8_t slot, ble_hid_device_slot_t *out)
+{
+    if (slot >= BLE_HID_DEVICE_SLOT_COUNT || out == NULL) {
+        return false;
+    }
+
+    *out = s_device_slots[slot];
+    return s_device_slots[slot].valid;
+}
+
+bool ble_hid_is_pairing_mode(void)
+{
+    return s_pairing_discoverable;
+}
+
+esp_err_t ble_hid_connect_selected_device(void)
+{
+    s_allow_auto_advertise = false;
+    s_pairing_discoverable = false;
+    s_direct_connect_pending = false;
+    stop_advertising_now();
+
+    if (s_connected) {
+        ESP_RETURN_ON_ERROR(ble_hid_disconnect(), TAG, "disconnect before slot switch failed");
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+
+    if (!s_adv_config_done || !s_scan_rsp_config_done) {
+        s_direct_connect_pending = true;
+        ESP_LOGI(TAG, "direct advertising pending adv config");
+        return ESP_OK;
+    }
+
+    ble_hid_device_slot_t *slot = &s_device_slots[s_selected_device_slot];
+    if (!slot->valid) {
+        ESP_LOGI(TAG, "selected device slot %u is empty", (unsigned)(s_selected_device_slot + 1));
+        return ESP_OK;
+    }
+
+    memcpy(s_direct_adv_params.peer_addr, slot->addr, 6);
+    s_direct_adv_params.peer_addr_type = (esp_ble_addr_type_t)slot->addr_type;
+    esp_err_t ret = esp_ble_gap_start_advertising(&s_direct_adv_params);
+    if (ret == ESP_OK) {
+        s_advertising = true;
+    }
+    ESP_LOGI(TAG, "direct advertising for slot %u", (unsigned)(s_selected_device_slot + 1));
+    return ret;
+}
+
+esp_err_t ble_hid_pair_selected_device(void)
+{
+    if (s_connected) {
+        ESP_RETURN_ON_ERROR(ble_hid_disconnect(), TAG, "disconnect before pairing failed");
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    ble_hid_device_slot_t *slot = &s_device_slots[s_selected_device_slot];
+    if (slot->valid) {
+        remove_bond_for_addr(slot->addr);
+        memset(slot, 0, sizeof(*slot));
+        save_device_slot(s_selected_device_slot);
+    }
+
+    s_pairing_discoverable = true;
+    s_allow_auto_advertise = true;
+    s_direct_connect_pending = false;
+    stop_advertising_now();
+    if (!s_adv_config_done || !s_scan_rsp_config_done) {
+        ESP_LOGI(TAG, "pairing mode pending adv config");
+        return ESP_OK;
+    }
+
+    esp_err_t ret = esp_ble_gap_start_advertising(&s_adv_params);
+    if (ret == ESP_OK) {
+        s_advertising = true;
+    }
+    ESP_LOGI(TAG, "pairing mode for slot %u", (unsigned)(s_selected_device_slot + 1));
+    return ret;
+}
+
+esp_err_t ble_hid_clear_pairing(void)
+{
+    int dev_num = esp_ble_get_bond_device_num();
+    ESP_LOGI(TAG, "clear pairing, bonded devices=%d", dev_num);
+
+    s_allow_auto_advertise = false;
+    s_pairing_discoverable = false;
+    if (s_connected && ble_hid_disconnect() != ESP_OK) {
+        ESP_LOGW(TAG, "disconnect before clear failed");
+    }
+
+    if (dev_num > 0) {
+        esp_ble_bond_dev_t bonds[dev_num];
+        ESP_RETURN_ON_ERROR(esp_ble_get_bond_device_list(&dev_num, bonds), TAG, "get bond list failed");
+
+        for (int i = 0; i < dev_num; i++) {
+            esp_err_t ret = esp_ble_remove_bond_device(bonds[i].bd_addr);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "remove bond[%d] failed: %s", i, esp_err_to_name(ret));
+            }
+        }
+    }
+
+    stop_advertising_now();
+    memset(s_device_slots, 0, sizeof(s_device_slots));
+    s_selected_device_slot = 0;
+    save_selected_slot();
+    for (uint8_t i = 0; i < BLE_HID_DEVICE_SLOT_COUNT; i++) {
+        save_device_slot(i);
+    }
+    ESP_LOGI(TAG, "pairing memory cleared");
+    return ESP_OK;
 }
 
 static esp_err_t send_mouse_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel)
@@ -356,7 +823,7 @@ static esp_err_t send_mouse_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t
     uint8_t report[4] = {buttons, (uint8_t)dx, (uint8_t)dy, (uint8_t)wheel};
 
     ESP_LOGI(TAG, "mouse buttons=%u dx=%d dy=%d wheel=%d", buttons, dx, dy, wheel);
-    esp_err_t ret = esp_hidd_dev_input_set(s_hid_dev, BLE_HID_MOUSE_MAP_INDEX, BLE_HID_MOUSE_REPORT_ID, report, sizeof(report));
+    esp_err_t ret = esp_hidd_dev_input_set(s_hid_dev, BLE_HID_REPORT_MAP_INDEX, BLE_HID_MOUSE_REPORT_ID, report, sizeof(report));
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "mouse report failed: %s", esp_err_to_name(ret));
     }
@@ -372,15 +839,15 @@ esp_err_t ble_hid_drag_vertical(bool upward)
     // Define motion pipeline: corner → center → scroll → reset
     const mouse_step_t steps[] = {
         // ① fly to top-left corner
-        {MOUSE_STEP_MOVE,   -100, -100, 0,  10, 0},
-        {MOUSE_STEP_RESET,   0,   0,  0,   1, 30},
+        {MOUSE_STEP_MOVE,   0, -100, -100, 0,  10, 0},
+        {MOUSE_STEP_RESET,  0,  0,   0,   0,   1, 30},
         // ② move toward center
-        {MOUSE_STEP_MOVE,    0,  60, 0,  1, 0},
-        {MOUSE_STEP_RESET,   0,   0,  0,   1, 30},
+        {MOUSE_STEP_MOVE,   0,  0,   60,  0,   1, 0},
+        {MOUSE_STEP_RESET,  0,  0,   0,   0,   1, 30},
         // ③ scroll
-        {MOUSE_STEP_SCROLL,  0,   0,  wheel, BLE_HID_DRAG_STEPS, 0},
+        {MOUSE_STEP_SCROLL, 0,  0,   0,   wheel, BLE_HID_DRAG_STEPS, 0},
         // ④ reset
-        {MOUSE_STEP_RESET,   0,   0,  0,   1, 0},
+        {MOUSE_STEP_RESET,  0,  0,   0,   0,   1, 0},
     };
 
     return ble_hid_mouse_exec(steps, sizeof(steps) / sizeof(steps[0]));
@@ -399,15 +866,15 @@ esp_err_t ble_hid_mouse_exec(const mouse_step_t *steps, size_t count)
         switch (s->type) {
         case MOUSE_STEP_MOVE:
             for (uint8_t r = 0; r < s->repeat; r++) {
-                ESP_RETURN_ON_ERROR(send_mouse_report(0, s->dx, s->dy, 0),
+                ESP_RETURN_ON_ERROR(send_mouse_report(s->buttons, s->dx, s->dy, 0),
                                     TAG, "move step[%u] failed", (unsigned)i);
-                vTaskDelay(pdMS_TO_TICKS(3));
+                vTaskDelay(pdMS_TO_TICKS(10));
             }
             break;
 
         case MOUSE_STEP_SCROLL:
             for (uint8_t r = 0; r < s->repeat; r++) {
-                ESP_RETURN_ON_ERROR(send_mouse_report(0, 0, 0, s->wheel),
+                ESP_RETURN_ON_ERROR(send_mouse_report(s->buttons, 0, 0, s->wheel),
                                     TAG, "scroll step[%u] failed", (unsigned)i);
                 vTaskDelay(pdMS_TO_TICKS(10));
             }

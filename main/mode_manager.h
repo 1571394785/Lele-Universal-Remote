@@ -5,7 +5,8 @@
 
 #include "buttons.h"
 
-#define MODE_COUNT 3
+#define MODE_COUNT 5
+#define MENU_ITEM_MAX 5
 
 typedef enum {
     APP_SCREEN_MODE = 0,
@@ -17,9 +18,14 @@ typedef struct {
     const char *title;
     const char *line1;
     const char *line2;
+    bool show_addr;            // show BLE peer address on menu screen
+    bool show_status;          // show status page instead of menu items
+    bool show_web_control;     // show web control instructions instead of menu items
+    bool show_devices;         // show device slot list
+    bool blink_selected;       // blink current selected menu item
     uint8_t selected;           // current selection in menu
     uint8_t item_count;         // number of menu items
-    const char *items[MODE_COUNT]; // menu item names
+    const char *items[MENU_ITEM_MAX]; // menu item names
 } mode_view_t;
 
 typedef enum {
@@ -27,11 +33,21 @@ typedef enum {
     MODE_ACTION_KEYBOARD_KEY,
     MODE_ACTION_ABS_MOUSE_DRAG,
     MODE_ACTION_MEDIA,
+    MODE_ACTION_CLEAR_BONDS,
+    MODE_ACTION_WEB_START,
+    MODE_ACTION_WEB_STOP,
+    MODE_ACTION_CUSTOM_SHORTCUT_TAP,
+    MODE_ACTION_CUSTOM_SHORTCUT_PRESS,
+    MODE_ACTION_CUSTOM_SHORTCUT_RELEASE,
+    MODE_ACTION_DEVICE_CONNECT,
+    MODE_ACTION_DEVICE_PAIR,
 } mode_action_type_t;
 
 typedef struct {
     mode_action_type_t type;
-    int8_t value;
+    int16_t value;
+    uint8_t modifier;
+    button_key_t key;
 } mode_action_t;
 
 void mode_manager_init(void);

@@ -22,10 +22,10 @@ typedef struct {
 static const char *TAG = "buttons";
 
 static button_config_t s_buttons[] = {
-    {BUTTON_KEY_UP, GPIO_NUM_5, "上", 0, false, false},
-    {BUTTON_KEY_DOWN, GPIO_NUM_6, "下", 0, false, false},
-    {BUTTON_KEY_LEFT, GPIO_NUM_7, "左", 0, false, false},
-    {BUTTON_KEY_RIGHT, GPIO_NUM_4, "右", 0, false, false},
+    {BUTTON_KEY_UP,    GPIO_NUM_5,  "上",     0, false, false},
+    {BUTTON_KEY_DOWN,  GPIO_NUM_6,  "下",     0, false, false},
+    {BUTTON_KEY_LEFT,  GPIO_NUM_7,  "左",     0, false, false},
+    {BUTTON_KEY_RIGHT, GPIO_NUM_4,  "右",     0, false, false},
     {BUTTON_KEY_FUNC1, GPIO_NUM_41, "功能一", 0, false, false},
     {BUTTON_KEY_FUNC2, GPIO_NUM_40, "功能二", 0, false, false},
     {BUTTON_KEY_FUNC3, GPIO_NUM_42, "功能三", 0, false, false},
