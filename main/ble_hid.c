@@ -90,13 +90,23 @@ static const uint8_t HID_MOUSE_REPORT_MAP[] = {
     0x81, 0x01,       // Input (5 bits padding)
     0x05, 0x01,       // Usage Page (Generic Desktop)
     0x09, 0x30,       // Usage (X)
+    0x15, 0x81,       // Logical Minimum (-127)
+    0x25, 0x7F,       // Logical Maximum (127)
+    0x75, 0x08,       // Report Size (8)
+    0x95, 0x01,       // Report Count (1)
+    0x81, 0x06,       // Input (Data, Var, Rel)
     0x09, 0x31,       // Usage (Y)
+    0x15, 0x81,       // Logical Minimum (-127)
+    0x25, 0x7F,       // Logical Maximum (127)
+    0x75, 0x08,       // Report Size (8)
+    0x95, 0x01,       // Report Count (1)
+    0x81, 0x06,       // Input (Data, Var, Rel)
     0x09, 0x38,       // Usage (Wheel)
     0x15, 0x81,       // Logical Minimum (-127)
     0x25, 0x7F,       // Logical Maximum (127)
     0x75, 0x08,       // Report Size (8)
-    0x95, 0x03,       // Report Count (3)
-    0x81, 0x06,       // Input (Data, Variable, Relative)
+    0x95, 0x01,       // Report Count (1)
+    0x81, 0x06,       // Input (Data, Var, Rel)
     0xC0,             // End Physical Collection
     0xC0              // End Application Collection
 };
@@ -234,6 +244,7 @@ static void hidd_event_callback(void *handler_args, esp_event_base_t base, int32
         s_connected = true;
         s_advertising = false;
         ESP_LOGI(TAG, "connected");
+        esp_hidd_dev_battery_set(s_hid_dev, 100);
         break;
 
     case ESP_HIDD_DISCONNECT_EVENT:
@@ -362,6 +373,9 @@ esp_err_t ble_hid_drag_vertical(bool upward)
         ESP_RETURN_ON_ERROR(send_mouse_report(0, 0, 0, wheel), TAG, "scroll step failed");
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+
+    // Send zero report to reset wheel state
+    ESP_RETURN_ON_ERROR(send_mouse_report(0, 0, 0, 0), TAG, "scroll reset failed");
 
     return ESP_OK;
 }
