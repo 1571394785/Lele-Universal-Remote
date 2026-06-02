@@ -244,7 +244,7 @@ static void hidd_event_callback(void *handler_args, esp_event_base_t base, int32
         s_connected = true;
         s_advertising = false;
         ESP_LOGI(TAG, "connected");
-        esp_hidd_dev_battery_set(s_hid_dev, 100);
+        esp_hidd_dev_battery_set(s_hid_dev, 34);
         break;
 
     case ESP_HIDD_DISCONNECT_EVENT:
@@ -365,17 +365,71 @@ static esp_err_t send_mouse_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t
 
 esp_err_t ble_hid_drag_vertical(bool upward)
 {
-    int8_t wheel = upward ? -20 : 20;
+    int8_t wheel = upward ? -1 : 1;
 
     ESP_LOGI(TAG, "scroll %s start (%d steps, wheel=%d)", upward ? "up" : "down", BLE_HID_DRAG_STEPS, wheel);
 
-    for (int step = 0; step < BLE_HID_DRAG_STEPS; ++step) {
-        ESP_RETURN_ON_ERROR(send_mouse_report(0, 0, 0, wheel), TAG, "scroll step failed");
-        vTaskDelay(pdMS_TO_TICKS(10));
+    // Define motion pipeline: corner → center → scroll → reset
+    const mouse_step_t steps[] = {
+        // ① fly to top-left corner
+        {MOUSE_STEP_MOVE,   -100, -100, 0,  10, 0},
+        {MOUSE_STEP_RESET,   0,   0,  0,   1, 30},
+        // ② move toward center
+        {MOUSE_STEP_MOVE,    0,  60, 0,  1, 0},
+        {MOUSE_STEP_RESET,   0,   0,  0,   1, 30},
+        // ③ scroll
+        {MOUSE_STEP_SCROLL,  0,   0,  wheel, BLE_HID_DRAG_STEPS, 0},
+        // ④ reset
+        {MOUSE_STEP_RESET,   0,   0,  0,   1, 0},
+    };
+
+    return ble_hid_mouse_exec(steps, sizeof(steps) / sizeof(steps[0]));
+}
+
+esp_err_t ble_hid_mouse_exec(const mouse_step_t *steps, size_t count)
+{
+    if (!s_connected || s_hid_dev == NULL) {
+        ESP_LOGW(TAG, "mouse exec dropped (not connected)");
+        return ESP_OK;
     }
 
-    // Send zero report to reset wheel state
-    ESP_RETURN_ON_ERROR(send_mouse_report(0, 0, 0, 0), TAG, "scroll reset failed");
+    for (size_t i = 0; i < count; i++) {
+        const mouse_step_t *s = &steps[i];
+
+        switch (s->type) {
+        case MOUSE_STEP_MOVE:
+            for (uint8_t r = 0; r < s->repeat; r++) {
+                ESP_RETURN_ON_ERROR(send_mouse_report(0, s->dx, s->dy, 0),
+                                    TAG, "move step[%u] failed", (unsigned)i);
+                vTaskDelay(pdMS_TO_TICKS(3));
+            }
+            break;
+
+        case MOUSE_STEP_SCROLL:
+            for (uint8_t r = 0; r < s->repeat; r++) {
+                ESP_RETURN_ON_ERROR(send_mouse_report(0, 0, 0, s->wheel),
+                                    TAG, "scroll step[%u] failed", (unsigned)i);
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            break;
+
+        case MOUSE_STEP_RESET:
+            ESP_RETURN_ON_ERROR(send_mouse_report(0, 0, 0, 0),
+                                TAG, "reset step[%u] failed", (unsigned)i);
+            break;
+
+        case MOUSE_STEP_DELAY:
+            vTaskDelay(pdMS_TO_TICKS(s->delay_ms));
+            break;
+
+        default:
+            break;
+        }
+
+        if (s->delay_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS(s->delay_ms));
+        }
+    }
 
     return ESP_OK;
 }

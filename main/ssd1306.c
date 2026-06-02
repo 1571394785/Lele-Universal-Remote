@@ -4,9 +4,13 @@
 #include <ctype.h>
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "rom/ets_sys.h"
 
 #define OLED_I2C_PORT I2C_NUM_0
 #define OLED_I2C_SPEED_HZ 400000
@@ -16,6 +20,9 @@ static const char *TAG = "ssd1306";
 
 static i2c_master_bus_handle_t s_i2c_bus;
 static i2c_master_dev_handle_t s_oled_dev;
+
+// 屏幕帧缓冲区：128 * (64/8) = 1024 字节
+static uint8_t s_framebuf[OLED_WIDTH * (OLED_HEIGHT / 8)];
 
 extern const uint8_t gb2312_font_start[] asm("_binary_gb2312_16x16_bin_start");
 extern const uint8_t gb2312_font_end[] asm("_binary_gb2312_16x16_bin_end");
@@ -92,18 +99,6 @@ static esp_err_t ssd1306_cmds(const uint8_t *cmds, size_t len)
     buffer[0] = 0x00;
     memcpy(&buffer[1], cmds, len);
     return ssd1306_write(buffer, len + 1);
-}
-
-static esp_err_t ssd1306_set_cursor(int page, int col)
-{
-    if (page < 0 || page >= OLED_HEIGHT / 8 || col < 0 || col >= OLED_WIDTH) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    ESP_RETURN_ON_ERROR(ssd1306_cmd(0xB0 | (uint8_t)page), TAG, "set page failed");
-    ESP_RETURN_ON_ERROR(ssd1306_cmd(0x00 | (uint8_t)(col & 0x0F)), TAG, "set low column failed");
-    ESP_RETURN_ON_ERROR(ssd1306_cmd(0x10 | (uint8_t)((col >> 4) & 0x0F)), TAG, "set high column failed");
-    return ESP_OK;
 }
 
 static const uint8_t *font_for_char(char c)
@@ -214,26 +209,61 @@ static const uint8_t *gb2312_glyph(uint16_t gb)
 
 static esp_err_t ssd1306_draw_glyph16(int page, int col, const uint8_t glyph[32])
 {
-    uint8_t upper[17] = {0x40};
-    uint8_t lower[17] = {0x40};
-
     if (page < 0 || page + 1 >= OLED_HEIGHT / 8 || col < 0 || col + 16 > OLED_WIDTH) {
         return ESP_ERR_INVALID_ARG;
     }
 
     for (int x = 0; x < 16; ++x) {
-        upper[x + 1] = glyph[x * 2];
-        lower[x + 1] = glyph[x * 2 + 1];
+        s_framebuf[page * OLED_WIDTH + col + x] = glyph[x * 2];         // 上半行
+        s_framebuf[(page + 1) * OLED_WIDTH + col + x] = glyph[x * 2 + 1]; // 下半行
     }
 
-    ESP_RETURN_ON_ERROR(ssd1306_set_cursor(page, col), TAG, "glyph upper cursor failed");
-    ESP_RETURN_ON_ERROR(ssd1306_write(upper, sizeof(upper)), TAG, "glyph upper write failed");
-    ESP_RETURN_ON_ERROR(ssd1306_set_cursor(page + 1, col), TAG, "glyph lower cursor failed");
-    ESP_RETURN_ON_ERROR(ssd1306_write(lower, sizeof(lower)), TAG, "glyph lower write failed");
     return ESP_OK;
 }
 
-esp_err_t ssd1306_init(void)
+/**
+ * I2C 总线恢复：当 SDA 被从设备拉低卡死时，
+ * 通过 bit-bang SCL 时钟释放总线。
+ */
+static void i2c_bus_recover(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << OLED_SCL_GPIO) | (1ULL << OLED_SDA_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    };
+    gpio_config(&io_conf);
+
+    gpio_set_level(OLED_SCL_GPIO, 1);
+    gpio_set_level(OLED_SDA_GPIO, 1);
+    ets_delay_us(5);
+
+    // 检测 SDA 是否被拉低
+    gpio_set_direction(OLED_SDA_GPIO, GPIO_MODE_INPUT);
+    if (gpio_get_level(OLED_SDA_GPIO) == 0) {
+        ESP_LOGW(TAG, "SDA stuck low, sending clock pulses to recover");
+        for (int i = 0; i < 16; i++) {
+            gpio_set_level(OLED_SCL_GPIO, 0);
+            ets_delay_us(5);
+            gpio_set_level(OLED_SCL_GPIO, 1);
+            ets_delay_us(5);
+        }
+        // 发送 STOP 条件
+        gpio_set_direction(OLED_SDA_GPIO, GPIO_MODE_OUTPUT);
+        gpio_set_level(OLED_SDA_GPIO, 0);
+        ets_delay_us(5);
+        gpio_set_level(OLED_SDA_GPIO, 1);
+        ets_delay_us(5);
+    }
+
+    gpio_set_direction(OLED_SDA_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(OLED_SDA_GPIO, 1);
+    gpio_set_level(OLED_SCL_GPIO, 1);
+    ets_delay_us(10);
+}
+
+static esp_err_t ssd1306_do_init(void)
 {
     i2c_master_bus_config_t bus_config = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
@@ -256,7 +286,7 @@ esp_err_t ssd1306_init(void)
 
     const uint8_t init_cmds[] = {
         0xAE,       // Display off
-        0x20, 0x02, // Page addressing mode
+        0x20, 0x00, // 水平寻址模式（用于整帧刷新）
         0xB0,
         0xC8,
         0x00,
@@ -278,20 +308,49 @@ esp_err_t ssd1306_init(void)
 
     ESP_RETURN_ON_ERROR(ssd1306_cmds(init_cmds, sizeof(init_cmds)), TAG, "oled init commands failed");
     ESP_RETURN_ON_ERROR(ssd1306_clear(), TAG, "oled clear failed");
-    ESP_LOGI(TAG, "OLED initialized: addr=0x%02X sda=%d scl=%d", OLED_I2C_ADDR, OLED_SDA_GPIO, OLED_SCL_GPIO);
+    ESP_RETURN_ON_ERROR(ssd1306_flush(), TAG, "oled flush failed");
     return ESP_OK;
+}
+
+esp_err_t ssd1306_init(void)
+{
+    // 最多重试 3 次，每次之间等待 200ms
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+            ESP_LOGW(TAG, "OLED init retry %d/2", attempt);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+
+        // 每次重试前先恢复 I2C 总线
+        i2c_bus_recover();
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        esp_err_t ret = ssd1306_do_init();
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "OLED initialized: addr=0x%02X sda=%d scl=%d (attempt %d)",
+                     OLED_I2C_ADDR, OLED_SDA_GPIO, OLED_SCL_GPIO, attempt + 1);
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG, "OLED init attempt %d failed: %s", attempt + 1, esp_err_to_name(ret));
+        // 销毁 I2C 总线以便下次重试
+        if (s_oled_dev) {
+            i2c_master_bus_rm_device(s_oled_dev);
+            s_oled_dev = NULL;
+        }
+        if (s_i2c_bus) {
+            i2c_del_master_bus(s_i2c_bus);
+            s_i2c_bus = NULL;
+        }
+    }
+
+    ESP_LOGE(TAG, "OLED init failed after 3 attempts");
+    return ESP_FAIL;
 }
 
 esp_err_t ssd1306_clear(void)
 {
-    uint8_t data[OLED_WIDTH + 1] = {0};
-    data[0] = 0x40;
-
-    for (int page = 0; page < OLED_HEIGHT / 8; ++page) {
-        ESP_RETURN_ON_ERROR(ssd1306_set_cursor(page, 0), TAG, "clear set cursor failed");
-        ESP_RETURN_ON_ERROR(ssd1306_write(data, sizeof(data)), TAG, "clear write failed");
-    }
-
+    memset(s_framebuf, 0, sizeof(s_framebuf));
     return ESP_OK;
 }
 
@@ -301,12 +360,12 @@ esp_err_t ssd1306_draw_text(int page, int col, const char *text)
         return ESP_ERR_INVALID_ARG;
     }
 
-    ESP_RETURN_ON_ERROR(ssd1306_set_cursor(page, col), TAG, "text set cursor failed");
-
     while (*text != '\0' && col + 6 <= OLED_WIDTH) {
         const uint8_t *glyph = font_for_char(*text++);
-        uint8_t data[] = {0x40, glyph[0], glyph[1], glyph[2], glyph[3], glyph[4], 0x00};
-        ESP_RETURN_ON_ERROR(ssd1306_write(data, sizeof(data)), TAG, "text write failed");
+        for (int i = 0; i < 5; ++i) {
+            s_framebuf[page * OLED_WIDTH + col + i] = glyph[i];
+        }
+        s_framebuf[page * OLED_WIDTH + col + 5] = 0x00; // 间隔列
         col += 6;
     }
 
@@ -336,17 +395,57 @@ esp_err_t ssd1306_draw_text16(int page, int col, const char *text)
             ESP_RETURN_ON_ERROR(ssd1306_draw_glyph16(page, col, glyph), TAG, "draw gb2312 glyph failed");
             col += 16;
         } else {
-            if (col + 6 > OLED_WIDTH) {
+            if (col + 8 > OLED_WIDTH) {
                 break;
             }
             const uint8_t *ascii = font_for_char((char)codepoint);
-            uint8_t data[] = {0x40, ascii[0], ascii[1], ascii[2], ascii[3], ascii[4], 0x00};
-            ESP_RETURN_ON_ERROR(ssd1306_set_cursor(page, col), TAG, "draw ascii cursor failed");
-            ESP_RETURN_ON_ERROR(ssd1306_write(data, sizeof(data)), TAG, "draw ascii failed");
-            col += 6;
+            // 5x7 字形在 16px 行中垂直居中：向下偏移 4px
+            // upper page: glyph << 4  |  lower page: glyph >> 4
+            for (int i = 0; i < 5; ++i) {
+                uint8_t g = ascii[i];
+                s_framebuf[page * OLED_WIDTH + col + 2 + i] = g << 4;
+                s_framebuf[(page + 1) * OLED_WIDTH + col + 2 + i] = g >> 4;
+            }
+            col += 8;
         }
 
         text += consumed;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t ssd1306_invert_area(int start_page, int end_page, int col_start, int col_end)
+{
+    if (start_page < 0) start_page = 0;
+    if (end_page > OLED_HEIGHT / 8) end_page = OLED_HEIGHT / 8;
+    if (col_start < 0) col_start = 0;
+    if (col_end > OLED_WIDTH) col_end = OLED_WIDTH;
+
+    for (int page = start_page; page < end_page; page++) {
+        for (int col = col_start; col < col_end; col++) {
+            s_framebuf[page * OLED_WIDTH + col] ^= 0xFF;
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t ssd1306_flush(void)
+{
+    // 设置水平寻址模式：列 0~127，页 0~7
+    ESP_RETURN_ON_ERROR(ssd1306_cmd(0x21), TAG, "flush col range failed");
+    ESP_RETURN_ON_ERROR(ssd1306_cmd(0x00), TAG, "flush col start failed");
+    ESP_RETURN_ON_ERROR(ssd1306_cmd(0x7F), TAG, "flush col end failed");
+    ESP_RETURN_ON_ERROR(ssd1306_cmd(0x22), TAG, "flush page range failed");
+    ESP_RETURN_ON_ERROR(ssd1306_cmd(0x00), TAG, "flush page start failed");
+    ESP_RETURN_ON_ERROR(ssd1306_cmd(0x07), TAG, "flush page end failed");
+
+    // 逐页发送帧缓冲区（每页 128 字节 + 1 字节数据前缀 = 129 字节）
+    for (int page = 0; page < OLED_HEIGHT / 8; ++page) {
+        uint8_t data[OLED_WIDTH + 1];
+        data[0] = 0x40; // 数据模式
+        memcpy(&data[1], &s_framebuf[page * OLED_WIDTH], OLED_WIDTH);
+        ESP_RETURN_ON_ERROR(ssd1306_write(data, sizeof(data)), TAG, "flush page write failed");
     }
 
     return ESP_OK;
