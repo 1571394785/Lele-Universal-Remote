@@ -23,6 +23,7 @@
 #include "freertos/task.h"
 
 #define BLE_HID_KEYBOARD_MAP_INDEX 0
+#define BLE_HID_MOUSE_MAP_INDEX 1
 #define BLE_HID_KEYBOARD_REPORT_ID 1
 #define BLE_HID_MOUSE_REPORT_ID 2
 #define BLE_HID_DRAG_STEPS 20
@@ -42,7 +43,7 @@ static uint8_t s_hid_service_uuid[] = {
     0x00, 0x10, 0x00, 0x00, 0x12, 0x18, 0x00, 0x00,
 };
 
-static const uint8_t HID_REPORT_MAP[] = {
+static const uint8_t HID_KEYBOARD_REPORT_MAP[] = {
     0x05, 0x01,       // Usage Page (Generic Desktop)
     0x09, 0x06,       // Usage (Keyboard)
     0xA1, 0x01,       // Collection (Application)
@@ -67,7 +68,9 @@ static const uint8_t HID_REPORT_MAP[] = {
     0x29, 0x65,
     0x81, 0x00,       // Input (6 key array)
     0xC0,             // End Collection
+};
 
+static const uint8_t HID_MOUSE_REPORT_MAP[] = {
     0x05, 0x01,       // Usage Page (Generic Desktop)
     0x09, 0x02,       // Usage (Mouse)
     0xA1, 0x01,       // Collection (Application)
@@ -100,8 +103,12 @@ static const uint8_t HID_REPORT_MAP[] = {
 
 static esp_hid_raw_report_map_t s_hid_report_maps[] = {
     {
-        .data = HID_REPORT_MAP,
-        .len = sizeof(HID_REPORT_MAP),
+        .data = HID_KEYBOARD_REPORT_MAP,
+        .len = sizeof(HID_KEYBOARD_REPORT_MAP),
+    },
+    {
+        .data = HID_MOUSE_REPORT_MAP,
+        .len = sizeof(HID_MOUSE_REPORT_MAP),
     },
 };
 
@@ -113,7 +120,7 @@ static esp_hid_device_config_t s_hid_config = {
     .manufacturer_name = "ESP32",
     .serial_number = "0001",
     .report_maps = s_hid_report_maps,
-    .report_maps_len = 1,
+    .report_maps_len = 2,
 };
 
 static esp_ble_adv_data_t s_adv_data = {
@@ -122,7 +129,7 @@ static esp_ble_adv_data_t s_adv_data = {
     .include_txpower = true,
     .min_interval = 0x0006,
     .max_interval = 0x0010,
-    .appearance = ESP_BLE_APPEARANCE_HID_KEYBOARD,
+    .appearance = ESP_BLE_APPEARANCE_GENERIC_HID,
     .manufacturer_len = 0,
     .p_manufacturer_data = NULL,
     .service_data_len = 0,
@@ -338,7 +345,7 @@ static esp_err_t send_mouse_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t
     uint8_t report[4] = {buttons, (uint8_t)dx, (uint8_t)dy, (uint8_t)wheel};
 
     ESP_LOGI(TAG, "mouse buttons=%u dx=%d dy=%d wheel=%d", buttons, dx, dy, wheel);
-    esp_err_t ret = esp_hidd_dev_input_set(s_hid_dev, BLE_HID_KEYBOARD_MAP_INDEX, BLE_HID_MOUSE_REPORT_ID, report, sizeof(report));
+    esp_err_t ret = esp_hidd_dev_input_set(s_hid_dev, BLE_HID_MOUSE_MAP_INDEX, BLE_HID_MOUSE_REPORT_ID, report, sizeof(report));
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "mouse report failed: %s", esp_err_to_name(ret));
     }
