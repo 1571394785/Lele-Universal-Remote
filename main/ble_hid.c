@@ -18,6 +18,7 @@
 #include "esp_hidd.h"
 #include "esp_hidd_gatts.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -28,12 +29,14 @@
 #define BLE_HID_KEYBOARD_REPORT_ID 1
 #define BLE_HID_MOUSE_REPORT_ID 2
 #define BLE_HID_CONSUMER_REPORT_ID 3
+#define BLE_HID_GAMEPAD_REPORT_ID 4
 #define BLE_HID_DRAG_STEPS 5
 #define BLE_HID_BATTERY_FIRST_NOTIFY_MS 1000
 #define BLE_HID_BATTERY_NOTIFY_INTERVAL_MS 60000
 #define BLE_HID_BATTERY_TASK_STACK 4096
 #define BLE_HID_DEVICE_NVS_NAMESPACE "bledev"
 #define BLE_HID_DEVICE_NVS_CURRENT "current"
+#define BLE_HID_DEVICE_NVS_FULL_MODE "fullmode"
 
 static const char *TAG = "ble_hid";
 static const char *DEVICE_NAME = "乐乐牌遥控器";
@@ -53,13 +56,14 @@ static char s_connected_addr[18]; // "XX:XX:XX:XX:XX:XX"
 static TaskHandle_t s_battery_task;
 static TickType_t s_next_battery_notify_tick;
 static uint8_t s_last_battery_level;
+static bool s_full_hid_mode;
 
 static uint8_t s_hid_service_uuid[] = {
     0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
     0x00, 0x10, 0x00, 0x00, 0x12, 0x18, 0x00, 0x00,
 };
 
-static const uint8_t HID_REPORT_MAP[] = {
+static const uint8_t HID_REPORT_MAP_COMPAT[] = {
     0x05, 0x01,       // Usage Page (Generic Desktop)
     0x09, 0x06,       // Usage (Keyboard)
     0xA1, 0x01,       // Collection (Application)
@@ -138,10 +142,103 @@ static const uint8_t HID_REPORT_MAP[] = {
     0xC0              // End Application Collection
 };
 
+static const uint8_t HID_REPORT_MAP_FULL[] = {
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x06,       // Usage (Keyboard)
+    0xA1, 0x01,       // Collection (Application)
+    0x85, BLE_HID_KEYBOARD_REPORT_ID,
+    0x05, 0x07,       // Usage Page (Keyboard/Keypad)
+    0x19, 0xE0,       // Usage Minimum (Keyboard LeftControl)
+    0x29, 0xE7,       // Usage Maximum (Keyboard Right GUI)
+    0x15, 0x00,
+    0x25, 0x01,
+    0x75, 0x01,
+    0x95, 0x08,
+    0x81, 0x02,       // Input (Modifier byte)
+    0x95, 0x01,
+    0x75, 0x08,
+    0x81, 0x01,       // Input (Reserved byte)
+    0x95, 0x06,
+    0x75, 0x08,
+    0x15, 0x00,
+    0x25, 0x65,
+    0x05, 0x07,
+    0x19, 0x00,
+    0x29, 0x65,
+    0x81, 0x00,       // Input (6 key array)
+    0xC0,             // End Collection
+
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x02,       // Usage (Mouse)
+    0xA1, 0x01,       // Collection (Application)
+    0x85, BLE_HID_MOUSE_REPORT_ID,
+    0x09, 0x01,       // Usage (Pointer)
+    0xA1, 0x00,       // Collection (Physical)
+    0x05, 0x09,       // Usage Page (Button)
+    0x19, 0x01,
+    0x29, 0x03,
+    0x15, 0x00,
+    0x25, 0x01,
+    0x95, 0x03,
+    0x75, 0x01,
+    0x81, 0x02,       // Input (3 buttons)
+    0x95, 0x01,
+    0x75, 0x05,
+    0x81, 0x01,       // Input (5 bits padding)
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x30,       // Usage (X)
+    0x15, 0x81,       // Logical Minimum (-127)
+    0x25, 0x7F,       // Logical Maximum (127)
+    0x75, 0x08,       // Report Size (8)
+    0x95, 0x01,       // Report Count (1)
+    0x81, 0x06,       // Input (Data, Var, Rel)
+    0x09, 0x31,       // Usage (Y)
+    0x15, 0x81,       // Logical Minimum (-127)
+    0x25, 0x7F,       // Logical Maximum (127)
+    0x75, 0x08,       // Report Size (8)
+    0x95, 0x01,       // Report Count (1)
+    0x81, 0x06,       // Input (Data, Var, Rel)
+    0x09, 0x38,       // Usage (Wheel)
+    0x15, 0x81,       // Logical Minimum (-127)
+    0x25, 0x7F,       // Logical Maximum (127)
+    0x75, 0x08,       // Report Size (8)
+    0x95, 0x01,       // Report Count (1)
+    0x81, 0x06,       // Input (Data, Var, Rel)
+    0xC0,             // End Physical Collection
+    0xC0,             // End Application Collection
+
+    0x05, 0x0C,       // Usage Page (Consumer)
+    0x09, 0x01,       // Usage (Consumer Control)
+    0xA1, 0x01,       // Collection (Application)
+    0x85, BLE_HID_CONSUMER_REPORT_ID,
+    0x15, 0x00,       // Logical Minimum (0)
+    0x26, 0xFF, 0x03, // Logical Maximum (0x03FF)
+    0x19, 0x00,       // Usage Minimum (0)
+    0x2A, 0xFF, 0x03, // Usage Maximum (0x03FF)
+    0x75, 0x10,       // Report Size (16)
+    0x95, 0x01,       // Report Count (1)
+    0x81, 0x00,       // Input (Data, Array, Abs)
+    0xC0,             // End Application Collection
+
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x05,       // Usage (Game Pad)
+    0xA1, 0x01,       // Collection (Application)
+    0x85, BLE_HID_GAMEPAD_REPORT_ID,
+    0x05, 0x09,       // Usage Page (Button)
+    0x19, 0x01,       // Usage Minimum (Button 1)
+    0x29, 0x08,       // Usage Maximum (Button 8)
+    0x15, 0x00,       // Logical Minimum (0)
+    0x25, 0x01,       // Logical Maximum (1)
+    0x75, 0x01,       // Report Size (1)
+    0x95, 0x08,       // Report Count (8)
+    0x81, 0x02,       // Input (Data, Var, Abs)
+    0xC0              // End Application Collection
+};
+
 static esp_hid_raw_report_map_t s_hid_report_maps[] = {
     {
-        .data = HID_REPORT_MAP,
-        .len = sizeof(HID_REPORT_MAP),
+        .data = HID_REPORT_MAP_COMPAT,
+        .len = sizeof(HID_REPORT_MAP_COMPAT),
     },
 };
 
@@ -217,6 +314,35 @@ static void load_device_slots(void)
     }
 
     nvs_close(h);
+}
+
+static void load_hid_mode(void)
+{
+    nvs_handle_t h;
+    uint8_t full_mode = 0;
+
+    if (nvs_open(BLE_HID_DEVICE_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, BLE_HID_DEVICE_NVS_FULL_MODE, &full_mode);
+        nvs_close(h);
+    }
+
+    s_full_hid_mode = full_mode != 0;
+    s_hid_report_maps[0].data = s_full_hid_mode ? HID_REPORT_MAP_FULL : HID_REPORT_MAP_COMPAT;
+    s_hid_report_maps[0].len = s_full_hid_mode ? sizeof(HID_REPORT_MAP_FULL) : sizeof(HID_REPORT_MAP_COMPAT);
+    ESP_LOGI(TAG, "HID mode: %s", s_full_hid_mode ? "full" : "compatible");
+}
+
+static esp_err_t save_hid_mode(bool full_mode)
+{
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(BLE_HID_DEVICE_NVS_NAMESPACE, NVS_READWRITE, &h),
+                        TAG, "open hid mode nvs failed");
+    esp_err_t ret = nvs_set_u8(h, BLE_HID_DEVICE_NVS_FULL_MODE, full_mode ? 1 : 0);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(h);
+    }
+    nvs_close(h);
+    return ret;
 }
 
 static void save_selected_slot(void)
@@ -490,6 +616,7 @@ esp_err_t ble_hid_init(void)
 {
     ESP_RETURN_ON_ERROR(init_nvs(), TAG, "nvs init failed");
     load_device_slots();
+    load_hid_mode();
     s_allow_auto_advertise = false;
     s_pairing_discoverable = false;
     s_slot_connect_pending = false;
@@ -616,6 +743,35 @@ esp_err_t ble_hid_send_consumer(uint16_t usage)
     memset(report, 0, sizeof(report));
     return esp_hidd_dev_input_set(s_hid_dev, BLE_HID_REPORT_MAP_INDEX, BLE_HID_CONSUMER_REPORT_ID,
                                   report, sizeof(report));
+}
+
+esp_err_t ble_hid_send_gamepad(uint8_t buttons)
+{
+    if (!s_full_hid_mode || !s_connected || s_hid_dev == NULL) {
+        return ESP_OK;
+    }
+
+    uint8_t report[1] = {buttons};
+
+    ESP_LOGI(TAG, "gamepad buttons=0x%02x", report[0]);
+    return esp_hidd_dev_input_set(s_hid_dev, BLE_HID_REPORT_MAP_INDEX, BLE_HID_GAMEPAD_REPORT_ID,
+                                  report, sizeof(report));
+}
+
+bool ble_hid_is_full_mode(void)
+{
+    return s_full_hid_mode;
+}
+
+esp_err_t ble_hid_toggle_hid_mode(void)
+{
+    bool next_full_mode = !s_full_hid_mode;
+    ESP_LOGI(TAG, "switch HID mode to %s", next_full_mode ? "full" : "compatible");
+    ESP_RETURN_ON_ERROR(save_hid_mode(next_full_mode), TAG, "save hid mode failed");
+    ESP_RETURN_ON_ERROR(ble_hid_clear_pairing(), TAG, "clear pairing before mode switch failed");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_restart();
+    return ESP_OK;
 }
 
 esp_err_t ble_hid_disconnect(void)

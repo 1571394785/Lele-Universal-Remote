@@ -1,6 +1,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
-#include <stdio.h>
+#include "app_display.h"
+#include "app_gamepad.h"
 #include "battery_adc.h"
 #include "ble_hid.h"
 #include "buttons.h"
@@ -13,22 +14,6 @@
 
 static const char *TAG = "app";
 
-static uint8_t read_battery_percent(int *battery_mv)
-{
-    int mv = 0;
-    if (battery_adc_read_actual_mv(&mv) != ESP_OK) {
-        if (battery_mv != NULL) {
-            *battery_mv = 0;
-        }
-        return 0;
-    }
-
-    if (battery_mv != NULL) {
-        *battery_mv = mv;
-    }
-    return battery_adc_percent_from_mv(mv);
-}
-
 void app_main(void)
 {
     // 开机延时 1000ms，让电源电压稳定后再初始化外设
@@ -40,10 +25,7 @@ void app_main(void)
         return;
     }
 
-    ESP_ERROR_CHECK(ssd1306_clear());
-    ESP_ERROR_CHECK(ssd1306_draw_text24(4, 4, "万能遥控器"));
-    ESP_ERROR_CHECK(ssd1306_draw_text16(5, 4, "Powered By 乐乐"));
-    ESP_ERROR_CHECK(ssd1306_flush());
+    ESP_ERROR_CHECK(app_display_show_boot());
     vTaskDelay(pdMS_TO_TICKS(1500));
 
     ret = buttons_init();
@@ -73,96 +55,47 @@ void app_main(void)
     mode_view_t view = {0};
     mode_action_t action = {0};
     mode_manager_update(BUTTON_KEY_NONE, 0, &view, &action);
-    ESP_ERROR_CHECK(ssd1306_draw_text16(0, 0, view.title));
-    ESP_ERROR_CHECK(ssd1306_draw_battery_icon(0, 96, read_battery_percent(NULL)));
-    ESP_ERROR_CHECK(ssd1306_draw_bluetooth_icon(0, 112, false));
-    ESP_ERROR_CHECK(ssd1306_draw_text16(2, 0, view.line1));
-    ESP_ERROR_CHECK(ssd1306_draw_text16(5, 0, view.line2));
-    ESP_ERROR_CHECK(ssd1306_flush());
+    ESP_ERROR_CHECK(app_display_render_view(&view, false, NULL, 0, NULL, NULL));
 
     ESP_LOGI(TAG, "Mode manager ready");
 
     bool prev_connected = false;
     uint32_t last_status_refresh_ms = 0;
     uint32_t last_header_refresh_ms = 0;
+    app_gamepad_state_t gamepad = {0};
+    app_gamepad_state_init(&gamepad);
 
     while (true) {
-        button_key_t key = buttons_poll();
+        uint16_t button_mask = buttons_poll_mask();
+        button_key_t key = buttons_first_key_from_mask(button_mask);
         uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         bool connected = ble_hid_is_connected();
         const char *addr = ble_hid_get_connected_addr();
+        bool manager_changed = false;
+
+        action.type = MODE_ACTION_NONE;
+        action.value = 0;
+        action.modifier = 0;
+        action.key = BUTTON_KEY_NONE;
+
+        if (view.screen == APP_SCREEN_MODE && view.is_gamepad_mode) {
+            ESP_ERROR_CHECK(app_gamepad_handle_mode(&gamepad, button_mask, now_ms,
+                                                    &view, &manager_changed));
+        } else {
+            app_gamepad_filter_menu_key(&gamepad, button_mask, &key);
+            manager_changed = mode_manager_update(key, now_ms, &view, &action);
+            app_gamepad_reset_if_inactive(&gamepad, &view);
+        }
 
         bool status_refresh = view.screen == APP_SCREEN_MENU && view.show_status &&
                               now_ms - last_status_refresh_ms >= 1000;
         bool header_refresh = view.screen == APP_SCREEN_MODE && now_ms - last_header_refresh_ms >= 1000;
 
-        if (mode_manager_update(key, now_ms, &view, &action) || connected != prev_connected ||
+        if (manager_changed || connected != prev_connected ||
             status_refresh || header_refresh) {
-            ESP_ERROR_CHECK(ssd1306_clear());
-
-            if (view.screen == APP_SCREEN_MENU) {
-                // ── Menu screen ──
-                // Title at page 0 (hw pages 0-1)
-                ESP_ERROR_CHECK(ssd1306_draw_text16(0, 0, view.title));
-
-                if (view.show_status) {
-                    char mac_line[32];
-                    char bat_line[24];
-                    int battery_mv = 0;
-                    uint8_t battery_pct = read_battery_percent(&battery_mv);
-
-                    snprintf(mac_line, sizeof(mac_line), "MAC %s", addr ? addr : "No Link");
-                    if (battery_mv > 0) {
-                        snprintf(bat_line, sizeof(bat_line), "BAT %d.%02dV %u%%",
-                                 battery_mv / 1000, (battery_mv % 1000) / 10, battery_pct);
-                    } else {
-                        snprintf(bat_line, sizeof(bat_line), "BAT --");
-                    }
-
-                    ESP_ERROR_CHECK(ssd1306_draw_text(2, 0, mac_line));
-                    ESP_ERROR_CHECK(ssd1306_draw_text(4, 0, bat_line));
-                    last_status_refresh_ms = now_ms;
-                } else if (view.show_web_control) {
-                    ESP_ERROR_CHECK(ssd1306_draw_text16(2, 0, "AP 自定义设置"));
-                    ESP_ERROR_CHECK(ssd1306_draw_text(3, 0, ""));
-                    ESP_ERROR_CHECK(ssd1306_draw_text(4, 0, "URL 192.168.4.1"));
-                    ESP_ERROR_CHECK(ssd1306_draw_text(6, 0, "F2 Exit"));
-                } else {
-                    uint8_t base_page = 2;
-                    uint8_t vis = 3; // 可见行数
-                    uint8_t start = 0;
-                    if (view.item_count > vis) {
-                        if (view.selected >= vis - 1) {
-                            start = view.selected - (vis - 1);
-                        }
-                        if (start + vis > view.item_count) {
-                            start = view.item_count - vis;
-                        }
-                    }
-
-                    for (uint8_t i = 0; i < vis && start + i < view.item_count; i++) {
-                        uint8_t idx = start + i;
-                        ESP_ERROR_CHECK(ssd1306_draw_text16(base_page + i * 2, 0, view.items[idx]));
-                    }
-
-                    // 选中行反色
-                    if (view.item_count > 0) {
-                        uint8_t sel_pos = view.selected - start;
-                        ESP_ERROR_CHECK(ssd1306_invert_area(base_page + sel_pos * 2, base_page + 2 + sel_pos * 2, 0, OLED_WIDTH));
-                    }
-                }
-            } else {
-                // ── Mode screen ──
-                uint8_t battery_pct = read_battery_percent(NULL);
-                ESP_ERROR_CHECK(ssd1306_draw_text16(0, 0, view.title));
-                ESP_ERROR_CHECK(ssd1306_draw_battery_icon(0, 96, battery_pct));
-                ESP_ERROR_CHECK(ssd1306_draw_bluetooth_icon(0, 112, connected));
-                ESP_ERROR_CHECK(ssd1306_draw_text16(2, 0, view.line1));
-                ESP_ERROR_CHECK(ssd1306_draw_text16(5, 0, view.line2));
-                last_header_refresh_ms = now_ms;
-            }
-
-            ESP_ERROR_CHECK(ssd1306_flush());
+            ESP_ERROR_CHECK(app_display_render_view(&view, connected, addr, now_ms,
+                                                    &last_status_refresh_ms,
+                                                    &last_header_refresh_ms));
 
             ESP_LOGI(TAG, "Screen: %s / %s / %s  conn=%s",
                      view.title, view.line1 ? view.line1 : "-",
@@ -198,6 +131,8 @@ void app_main(void)
         } else if (action.type == MODE_ACTION_CLEAR_BONDS) {
             ESP_ERROR_CHECK(ble_hid_clear_pairing());
             ESP_ERROR_CHECK(custom_mode_clear_all());
+        } else if (action.type == MODE_ACTION_HID_MODE_TOGGLE) {
+            ESP_ERROR_CHECK(ble_hid_toggle_hid_mode());
         } else if (action.type == MODE_ACTION_WEB_START) {
             ESP_ERROR_CHECK(web_control_start());
         } else if (action.type == MODE_ACTION_WEB_STOP) {

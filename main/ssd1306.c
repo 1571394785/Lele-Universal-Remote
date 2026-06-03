@@ -160,6 +160,17 @@ static void draw_pixel(int x, int y, bool on)
     }
 }
 
+static void draw_pixel_ccw(int x, int y, bool on)
+{
+    if (x < 0 || x >= OLED_HEIGHT || y < 0 || y >= OLED_WIDTH) {
+        return;
+    }
+
+    int physical_x = OLED_WIDTH - 1 - y;
+    int physical_y = x;
+    draw_pixel(physical_x, physical_y, on);
+}
+
 static void draw_line(int x0, int y0, int x1, int y1)
 {
     int dx = x1 > x0 ? x1 - x0 : x0 - x1;
@@ -479,6 +490,57 @@ esp_err_t ssd1306_draw_text16(int page, int col, const char *text)
     return ESP_OK;
 }
 
+esp_err_t ssd1306_draw_text16_ccw(int y, int x, const char *text)
+{
+    if (text == NULL || x < 0 || y < 0 || y + 16 > OLED_WIDTH) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    while (*text != '\0' && x < OLED_HEIGHT) {
+        uint32_t codepoint = 0;
+        size_t consumed = 1;
+
+        if (!decode_utf8(text, &codepoint, &consumed)) {
+            codepoint = 0;
+        }
+
+        if (codepoint >= 0x80) {
+            if (x + 16 > OLED_HEIGHT) {
+                break;
+            }
+
+            uint16_t gb = 0;
+            const uint8_t *glyph = unicode_to_gb2312(codepoint, &gb) ? gb2312_glyph(gb) : UNKNOWN_16X16;
+            for (int dx = 0; dx < 16; dx++) {
+                for (int dy = 0; dy < 16; dy++) {
+                    bool on = (glyph[dx * 2 + dy / 8] & (1U << (dy % 8))) != 0;
+                    draw_pixel_ccw(x + dx, y + dy, on);
+                }
+            }
+            x += 16;
+        } else {
+            if (x + 8 > OLED_HEIGHT) {
+                break;
+            }
+
+            const uint8_t *ascii = font_for_char((char)codepoint);
+            for (int dx = 0; dx < 5; dx++) {
+                uint8_t g = ascii[dx];
+                for (int dy = 0; dy < 7; dy++) {
+                    if ((g & (1U << dy)) != 0) {
+                        draw_pixel_ccw(x + 2 + dx, y + 4 + dy, true);
+                    }
+                }
+            }
+            x += 8;
+        }
+
+        text += consumed;
+    }
+
+    return ESP_OK;
+}
+
 static void draw_glyph16_scaled24(int y0, int col, const uint8_t glyph[32])
 {
     for (int dy = 0; dy < 24; dy++) {
@@ -588,6 +650,37 @@ esp_err_t ssd1306_draw_battery_icon(int page, int col, uint8_t percent)
         for (int y = 5; y <= 10; y++) {
             draw_pixel(col + 2 + x, y0 + y, true);
         }
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t ssd1306_draw_scrollbar(uint8_t top_page, uint8_t page_count, uint8_t total, uint8_t visible, uint8_t selected)
+{
+    if (page_count == 0 || total <= visible || top_page + page_count > OLED_HEIGHT / 8) {
+        return ESP_OK;
+    }
+
+    int x = OLED_WIDTH - 2;
+    int y0 = top_page * 8;
+    int h = page_count * 8;
+    int thumb_h = (h * visible) / total;
+    if (thumb_h < 6) {
+        thumb_h = 6;
+    }
+    if (thumb_h > h) {
+        thumb_h = h;
+    }
+
+    int range = h - thumb_h;
+    int thumb_y = y0;
+    if (total > 1 && range > 0) {
+        thumb_y += (range * selected) / (total - 1);
+    }
+
+    for (int y = thumb_y; y < thumb_y + thumb_h; y++) {
+        draw_pixel(x - 1, y, true);
+        draw_pixel(x, y, true);
     }
 
     return ESP_OK;

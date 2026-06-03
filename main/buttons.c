@@ -53,9 +53,9 @@ esp_err_t buttons_init(void)
     return ESP_OK;
 }
 
-button_key_t buttons_poll(void)
+uint16_t buttons_poll_mask(void)
 {
-    button_key_t first_pressed = BUTTON_KEY_NONE;
+    uint16_t pressed_mask = 0;
 
     for (size_t i = 0; i < sizeof(s_buttons) / sizeof(s_buttons[0]); ++i) {
         button_config_t *button = &s_buttons[i];
@@ -74,12 +74,28 @@ button_key_t buttons_poll(void)
             button->debounced_pressed = button->raw_pressed;
         }
 
-        if (button->debounced_pressed && first_pressed == BUTTON_KEY_NONE) {
-            first_pressed = button->key;
+        if (button->debounced_pressed) {
+            pressed_mask |= BUTTON_MASK(button->key);
         }
     }
 
-    return first_pressed;
+    return pressed_mask;
+}
+
+button_key_t buttons_first_key_from_mask(uint16_t mask)
+{
+    for (size_t i = 0; i < sizeof(s_buttons) / sizeof(s_buttons[0]); ++i) {
+        if ((mask & BUTTON_MASK(s_buttons[i].key)) != 0) {
+            return s_buttons[i].key;
+        }
+    }
+
+    return BUTTON_KEY_NONE;
+}
+
+button_key_t buttons_poll(void)
+{
+    return buttons_first_key_from_mask(buttons_poll_mask());
 }
 
 const char *buttons_key_name_cn(button_key_t key)

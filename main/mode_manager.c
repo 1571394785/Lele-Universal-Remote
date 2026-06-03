@@ -1,5 +1,6 @@
 #include "mode_manager.h"
 
+#include "ble_hid.h"
 #include "custom_mode.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -13,6 +14,7 @@ typedef enum {
     APP_MODE_DOUYIN_ANDROID,
     APP_MODE_MEDIA_CTRL,
     APP_MODE_CUSTOM,
+    APP_MODE_GAMEPAD,
 } app_mode_t;
 
 typedef enum {
@@ -21,6 +23,7 @@ typedef enum {
     MENU_PAGE_SETTINGS,
     MENU_PAGE_STATUS,
     MENU_PAGE_WEB_CONTROL,
+    MENU_PAGE_HID_CONFIRM,
 } menu_page_t;
 
 static const char * const MODE_NAMES[MODE_COUNT] = {
@@ -29,14 +32,16 @@ static const char * const MODE_NAMES[MODE_COUNT] = {
     "抖音安卓",
     "多媒体控制",
     "自定义模式",
+    "手柄模式",
 };
 
 static const char * const MODE_ACTIONS[MODE_COUNT][4] = {
     [APP_MODE_DOUYIN_PC]     = {"方向上", "方向下", "待机", "空"},
     [APP_MODE_DOUYIN_IOS]    = {"上拖动", "下拖动", "待机", "空"},
     [APP_MODE_DOUYIN_ANDROID]= {"上拖动", "下拖动", "待机", "空"},
-    [APP_MODE_MEDIA_CTRL]    = {"音量+", "音量-", "待机", "切歌"},
+    [APP_MODE_MEDIA_CTRL]    = {"音量+", "音量-", "待机", "媒体键"},
     [APP_MODE_CUSTOM]        = {"自定义", "自定义", "待机", "自定义"},
+    [APP_MODE_GAMEPAD]       = {"十字上", "十字下", "待机", "ABXY"},
 };
 
 static const char * const ROOT_MENU_ITEMS[] = {
@@ -50,6 +55,7 @@ static const char * const SETTINGS_MENU_ITEMS[] = {
     "配对模式",
     "恢复出厂设置",
     "网页控制",
+    "兼容模式",
 };
 
 static app_mode_t s_mode;
@@ -136,6 +142,10 @@ static mode_action_t make_action(app_mode_t mode, button_key_t key)
             a.type = MODE_ACTION_MEDIA; a.value = 0x00B6; // Scan Previous Track
         } else if (key == BUTTON_KEY_RIGHT) {
             a.type = MODE_ACTION_MEDIA; a.value = 0x00B5; // Scan Next Track
+        } else if (key == BUTTON_KEY_FUNC2) {
+            a.type = MODE_ACTION_MEDIA; a.value = 0x00CD; // Play/Pause
+        } else if (key == BUTTON_KEY_FUNC3) {
+            a.type = MODE_ACTION_MEDIA; a.value = 0x00E2; // Mute
         }
         break;
 
@@ -144,6 +154,9 @@ static mode_action_t make_action(app_mode_t mode, button_key_t key)
         a.key = key;
         break;
     }
+
+    case APP_MODE_GAMEPAD:
+        break;
 
     default:
         break;
@@ -162,8 +175,11 @@ static void fill_view(mode_view_t *view)
         view->show_addr = false;
         view->show_status = s_menu_page == MENU_PAGE_STATUS;
         view->show_web_control = s_menu_page == MENU_PAGE_WEB_CONTROL;
+        view->show_hid_confirm = s_menu_page == MENU_PAGE_HID_CONFIRM;
         view->show_devices = false;
         view->blink_selected = false;
+        view->is_gamepad_mode = false;
+        view->show_scrollbar = false;
         view->selected = s_menu_sel;
 
         switch (s_menu_page) {
@@ -178,6 +194,7 @@ static void fill_view(mode_view_t *view)
         case MENU_PAGE_MODES:
             view->title = "模式切换";
             view->item_count = MODE_COUNT;
+            view->show_scrollbar = view->item_count > 3;
             for (uint8_t i = 0; i < view->item_count; i++) {
                 view->items[i] = MODE_NAMES[i];
             }
@@ -187,7 +204,8 @@ static void fill_view(mode_view_t *view)
             view->title = "设置";
             view->item_count = sizeof(SETTINGS_MENU_ITEMS) / sizeof(SETTINGS_MENU_ITEMS[0]);
             for (uint8_t i = 0; i < view->item_count; i++) {
-                view->items[i] = SETTINGS_MENU_ITEMS[i];
+                view->items[i] = (i == 4) ? (ble_hid_is_full_mode() ? "当前是完全模式" : "当前是兼容模式") :
+                                 SETTINGS_MENU_ITEMS[i];
             }
             break;
 
@@ -200,6 +218,13 @@ static void fill_view(mode_view_t *view)
             view->title = "网页控制";
             view->item_count = 0;
             break;
+
+        case MENU_PAGE_HID_CONFIRM:
+            view->title = ble_hid_is_full_mode() ? "切到兼容模式" : "切到完全模式";
+            view->line1 = "切换会重启";
+            view->line2 = "F1确认 F2取消";
+            view->item_count = 0;
+            break;
         }
         return;
     }
@@ -207,12 +232,15 @@ static void fill_view(mode_view_t *view)
     view->screen = APP_SCREEN_MODE;
     view->title = MODE_NAMES[s_mode];
     view->line1 = s_last_action;
-    view->line2 = "F1菜单";
+    view->line2 = (s_mode == APP_MODE_GAMEPAD) ? "BX菜单" : "F1菜单";
     view->show_addr = false;
     view->show_status = false;
     view->show_web_control = false;
+    view->show_hid_confirm = false;
     view->show_devices = false;
     view->blink_selected = false;
+    view->is_gamepad_mode = s_mode == APP_MODE_GAMEPAD;
+    view->show_scrollbar = false;
     view->selected = 0;
     view->item_count = 0;
 }
@@ -230,6 +258,15 @@ void mode_manager_init(void)
     s_last_key = BUTTON_KEY_NONE;
     s_menu_sel = 0;
     s_last_action = "待机";
+}
+
+void mode_manager_enter_menu(mode_view_t *view)
+{
+    s_menu_page = MENU_PAGE_ROOT;
+    s_menu_sel = 0;
+    s_screen = APP_SCREEN_MENU;
+    s_last_key = BUTTON_KEY_NONE;
+    fill_view(view);
 }
 
 bool mode_manager_update(button_key_t key, uint32_t now_ms, mode_view_t *view, mode_action_t *action)
@@ -269,7 +306,7 @@ bool mode_manager_update(button_key_t key, uint32_t now_ms, mode_view_t *view, m
                         action->type = MODE_ACTION_PAIRING_MODE;
                     } else if (s_menu_sel == 2) {
                         action->type = MODE_ACTION_CLEAR_BONDS;
-                    } else {
+                    } else if (s_menu_sel == 3) {
                         action->type = MODE_ACTION_WEB_START;
                     }
                 }
@@ -287,14 +324,24 @@ bool mode_manager_update(button_key_t key, uint32_t now_ms, mode_view_t *view, m
                     s_mode = APP_MODE_DOUYIN_PC;
                     nvs_save_mode((uint8_t)s_mode);
                     s_last_action = "恢复出厂";
-                } else {
+                } else if (s_menu_sel == 3) {
                     s_menu_page = MENU_PAGE_WEB_CONTROL;
+                    s_menu_sel = 0;
+                } else {
+                    s_menu_page = MENU_PAGE_HID_CONFIRM;
                     s_menu_sel = 0;
                 }
             } else if (s_menu_page == MENU_PAGE_STATUS) {
                 s_menu_sel = 0;
             } else if (s_menu_page == MENU_PAGE_WEB_CONTROL) {
                 s_menu_sel = 0;
+            } else if (s_menu_page == MENU_PAGE_HID_CONFIRM) {
+                if (action != NULL) {
+                    action->type = MODE_ACTION_HID_MODE_TOGGLE;
+                }
+                s_screen = APP_SCREEN_MODE;
+                s_menu_page = MENU_PAGE_ROOT;
+                s_last_action = ble_hid_is_full_mode() ? "兼容模式" : "完全模式";
             }
             changed = true;
         } else if (key == BUTTON_KEY_FUNC2 && key != s_last_key) {
@@ -306,6 +353,9 @@ bool mode_manager_update(button_key_t key, uint32_t now_ms, mode_view_t *view, m
                 }
                 s_menu_page = MENU_PAGE_ROOT;
                 s_menu_sel = 0;
+            } else if (s_menu_page == MENU_PAGE_HID_CONFIRM) {
+                s_menu_page = MENU_PAGE_SETTINGS;
+                s_menu_sel = 4;
             } else {
                 s_menu_page = MENU_PAGE_ROOT;
                 s_menu_sel = 0;
@@ -326,6 +376,8 @@ bool mode_manager_update(button_key_t key, uint32_t now_ms, mode_view_t *view, m
                 max_sel = 0;
             } else if (s_menu_page == MENU_PAGE_WEB_CONTROL) {
                 max_sel = 0;
+            } else if (s_menu_page == MENU_PAGE_HID_CONFIRM) {
+                max_sel = 0;
             }
             if (s_menu_sel < max_sel) s_menu_sel++;
             changed = true;
@@ -336,14 +388,11 @@ bool mode_manager_update(button_key_t key, uint32_t now_ms, mode_view_t *view, m
     }
 
     /* ── Mode screen ── */
-    // FUNC1 → enter menu
-    if (key == BUTTON_KEY_FUNC1 && key != s_last_key) {
-        s_menu_page = MENU_PAGE_ROOT;
-        s_menu_sel = 0;
-        s_screen = APP_SCREEN_MENU;
+    // FUNC1 enters menu in normal modes. Gamepad mode uses FUNC1+FUNC2 long press.
+    if (s_mode != APP_MODE_GAMEPAD && key == BUTTON_KEY_FUNC1 && key != s_last_key) {
+        mode_manager_enter_menu(view);
         changed = true;
         s_last_key = key;
-        fill_view(view);
         return changed;
     }
 

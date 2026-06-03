@@ -5,8 +5,8 @@
 
 #include "buttons.h"
 
-#define MODE_COUNT 5
-#define MENU_ITEM_MAX 5
+#define MODE_COUNT 6
+#define MENU_ITEM_MAX 6
 
 typedef enum {
     APP_SCREEN_MODE = 0,
@@ -21,8 +21,11 @@ typedef struct {
     bool show_addr;            // show BLE peer address on menu screen
     bool show_status;          // show status page instead of menu items
     bool show_web_control;     // show web control instructions instead of menu items
+    bool show_hid_confirm;     // show HID mode switch confirmation
     bool show_devices;         // show device slot list
     bool blink_selected;       // blink current selected menu item
+    bool is_gamepad_mode;      // current mode is BLE gamepad
+    bool show_scrollbar;       // menu has more rows than visible area
     uint8_t selected;           // current selection in menu
     uint8_t item_count;         // number of menu items
     const char *items[MENU_ITEM_MAX]; // menu item names
@@ -36,6 +39,7 @@ typedef enum {
     MODE_ACTION_DISCONNECT,
     MODE_ACTION_PAIRING_MODE,
     MODE_ACTION_CLEAR_BONDS,
+    MODE_ACTION_HID_MODE_TOGGLE,
     MODE_ACTION_WEB_START,
     MODE_ACTION_WEB_STOP,
     MODE_ACTION_CUSTOM_SHORTCUT_TAP,
@@ -52,3 +56,4 @@ typedef struct {
 
 void mode_manager_init(void);
 bool mode_manager_update(button_key_t key, uint32_t now_ms, mode_view_t *view, mode_action_t *action);
+void mode_manager_enter_menu(mode_view_t *view);
