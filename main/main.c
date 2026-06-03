@@ -29,16 +29,6 @@ static uint8_t read_battery_percent(int *battery_mv)
     return battery_adc_percent_from_mv(mv);
 }
 
-static const char *current_device_number(void)
-{
-    static const char * const labels[] = {"1", "2", "3", "4"};
-    uint8_t slot = ble_hid_get_selected_device_slot();
-    if (slot >= sizeof(labels) / sizeof(labels[0])) {
-        slot = 0;
-    }
-    return labels[slot];
-}
-
 void app_main(void)
 {
     // 开机延时 1000ms，让电源电压稳定后再初始化外设
@@ -84,7 +74,6 @@ void app_main(void)
     mode_action_t action = {0};
     mode_manager_update(BUTTON_KEY_NONE, 0, &view, &action);
     ESP_ERROR_CHECK(ssd1306_draw_text16(0, 0, view.title));
-    ESP_ERROR_CHECK(ssd1306_draw_text(0, 86, current_device_number()));
     ESP_ERROR_CHECK(ssd1306_draw_battery_icon(0, 96, read_battery_percent(NULL)));
     ESP_ERROR_CHECK(ssd1306_draw_bluetooth_icon(0, 112, false));
     ESP_ERROR_CHECK(ssd1306_draw_text16(2, 0, view.line1));
@@ -166,7 +155,6 @@ void app_main(void)
                 // ── Mode screen ──
                 uint8_t battery_pct = read_battery_percent(NULL);
                 ESP_ERROR_CHECK(ssd1306_draw_text16(0, 0, view.title));
-                ESP_ERROR_CHECK(ssd1306_draw_text(0, 86, current_device_number()));
                 ESP_ERROR_CHECK(ssd1306_draw_battery_icon(0, 96, battery_pct));
                 ESP_ERROR_CHECK(ssd1306_draw_bluetooth_icon(0, 112, connected));
                 ESP_ERROR_CHECK(ssd1306_draw_text16(2, 0, view.line1));

@@ -36,7 +36,7 @@
 #define BLE_HID_DEVICE_NVS_CURRENT "current"
 
 static const char *TAG = "ble_hid";
-static const char *DEVICE_NAME = "ESP32-HID";
+static const char *DEVICE_NAME = "乐乐牌遥控器";
 
 static esp_hidd_dev_t *s_hid_dev;
 static bool s_connected;
@@ -149,7 +149,7 @@ static esp_hid_device_config_t s_hid_config = {
     .vendor_id = 0x16C0,
     .product_id = 0x05DF,
     .version = 0x0100,
-    .device_name = "ESP32-HID",
+    .device_name = "乐乐牌遥控器",
     .manufacturer_name = "ESP32",
     .serial_number = "0001",
     .report_maps = s_hid_report_maps,
@@ -158,7 +158,7 @@ static esp_hid_device_config_t s_hid_config = {
 
 static esp_ble_adv_data_t s_adv_data = {
     .set_scan_rsp = false,
-    .include_name = true,
+    .include_name = false,
     .include_txpower = true,
     .min_interval = 0x0006,
     .max_interval = 0x0010,
@@ -174,7 +174,7 @@ static esp_ble_adv_data_t s_adv_data = {
 
 static esp_ble_adv_data_t s_scan_rsp_data = {
     .set_scan_rsp = true,
-    .include_name = false,
+    .include_name = true,
     .include_txpower = false,
 };
 
