@@ -1,15 +1,11 @@
 #include "mode_manager.h"
 
-#include <stdio.h>
-
-#include "ble_hid.h"
 #include "custom_mode.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
 #define NVS_NAMESPACE "remote"
 #define NVS_KEY_MODE  "mode"
-#define DEVICE_F1_LONG_MS 800
 
 typedef enum {
     APP_MODE_DOUYIN_PC = 0,
@@ -25,7 +21,6 @@ typedef enum {
     MENU_PAGE_SETTINGS,
     MENU_PAGE_STATUS,
     MENU_PAGE_WEB_CONTROL,
-    MENU_PAGE_DEVICES,
 } menu_page_t;
 
 static const char * const MODE_NAMES[MODE_COUNT] = {
@@ -48,26 +43,13 @@ static const char * const ROOT_MENU_ITEMS[] = {
     "模式切换",
     "设置",
     "状态",
-    "设备列表",
 };
 
 static const char * const SETTINGS_MENU_ITEMS[] = {
+    "断开连接",
+    "配对模式",
     "恢复出厂设置",
     "网页控制",
-};
-
-static const char * const DEVICE_MENU_ITEMS[] = {
-    "设备一",
-    "设备二",
-    "设备三",
-    "设备四",
-};
-
-static const char * const CURRENT_DEVICE_TITLES[] = {
-    "当前设备一",
-    "当前设备二",
-    "当前设备三",
-    "当前设备四",
 };
 
 static app_mode_t s_mode;
@@ -76,10 +58,6 @@ static menu_page_t s_menu_page;
 static button_key_t s_last_key;
 static uint8_t s_menu_sel;
 static const char *s_last_action;
-static uint32_t s_menu_f1_down_ms;
-static bool s_menu_f1_long_handled;
-static bool s_device_pairing_blink;
-static char s_device_item_labels[BLE_HID_DEVICE_SLOT_COUNT][20];
 
 static void nvs_save_mode(uint8_t mode)
 {
@@ -184,8 +162,8 @@ static void fill_view(mode_view_t *view)
         view->show_addr = false;
         view->show_status = s_menu_page == MENU_PAGE_STATUS;
         view->show_web_control = s_menu_page == MENU_PAGE_WEB_CONTROL;
-        view->show_devices = s_menu_page == MENU_PAGE_DEVICES;
-        view->blink_selected = s_menu_page == MENU_PAGE_DEVICES && s_device_pairing_blink;
+        view->show_devices = false;
+        view->blink_selected = false;
         view->selected = s_menu_sel;
 
         switch (s_menu_page) {
@@ -222,22 +200,6 @@ static void fill_view(mode_view_t *view)
             view->title = "网页控制";
             view->item_count = 0;
             break;
-
-        case MENU_PAGE_DEVICES:
-            view->title = CURRENT_DEVICE_TITLES[ble_hid_get_selected_device_slot()];
-            view->item_count = sizeof(DEVICE_MENU_ITEMS) / sizeof(DEVICE_MENU_ITEMS[0]);
-            for (uint8_t i = 0; i < view->item_count; i++) {
-                ble_hid_device_slot_t slot;
-                if (ble_hid_get_device_slot(i, &slot)) {
-                    snprintf(s_device_item_labels[i], sizeof(s_device_item_labels[i]),
-                             "%s %02x%02x", DEVICE_MENU_ITEMS[i], slot.addr[4], slot.addr[5]);
-                } else {
-                    snprintf(s_device_item_labels[i], sizeof(s_device_item_labels[i]),
-                             "%s ----", DEVICE_MENU_ITEMS[i]);
-                }
-                view->items[i] = s_device_item_labels[i];
-            }
-            break;
         }
         return;
     }
@@ -268,22 +230,11 @@ void mode_manager_init(void)
     s_last_key = BUTTON_KEY_NONE;
     s_menu_sel = 0;
     s_last_action = "待机";
-    s_menu_f1_down_ms = 0;
-    s_menu_f1_long_handled = false;
-    s_device_pairing_blink = false;
 }
 
 bool mode_manager_update(button_key_t key, uint32_t now_ms, mode_view_t *view, mode_action_t *action)
 {
     bool changed = key != s_last_key;
-
-    if (s_device_pairing_blink && !ble_hid_is_pairing_mode() &&
-        !(s_screen == APP_SCREEN_MENU && s_menu_page == MENU_PAGE_DEVICES &&
-          key == BUTTON_KEY_FUNC1 && s_last_key == BUTTON_KEY_FUNC1 &&
-          now_ms - s_menu_f1_down_ms >= DEVICE_F1_LONG_MS)) {
-        s_device_pairing_blink = false;
-        changed = true;
-    }
 
     if (action != NULL) {
         action->type = MODE_ACTION_NONE;
@@ -294,45 +245,16 @@ bool mode_manager_update(button_key_t key, uint32_t now_ms, mode_view_t *view, m
 
     /* ── Menu mode ── */
     if (s_screen == APP_SCREEN_MENU) {
-        if (s_menu_page == MENU_PAGE_DEVICES && key == BUTTON_KEY_FUNC1 && s_last_key != BUTTON_KEY_FUNC1) {
-            s_menu_f1_down_ms = now_ms;
-            s_menu_f1_long_handled = false;
-            changed = true;
-        } else if (s_menu_page == MENU_PAGE_DEVICES && key == BUTTON_KEY_FUNC1 &&
-                   !s_menu_f1_long_handled && now_ms - s_menu_f1_down_ms >= DEVICE_F1_LONG_MS) {
-            if (action != NULL) {
-                action->type = MODE_ACTION_DEVICE_PAIR;
-                action->value = s_menu_sel;
-            }
-            s_device_pairing_blink = true;
-            s_menu_f1_long_handled = true;
-            changed = true;
-        } else if (s_menu_page == MENU_PAGE_DEVICES && key != BUTTON_KEY_FUNC1 &&
-                   s_last_key == BUTTON_KEY_FUNC1 && !s_menu_f1_long_handled) {
-            if (action != NULL) {
-                action->type = MODE_ACTION_DEVICE_CONNECT;
-                action->value = s_menu_sel;
-            }
-            s_device_pairing_blink = false;
-            changed = true;
-        } else if (key == BUTTON_KEY_FUNC1 && key != s_last_key) {
+        if (key == BUTTON_KEY_FUNC1 && key != s_last_key) {
             if (s_menu_page == MENU_PAGE_ROOT) {
                 if (s_menu_sel == 0) {
                     s_menu_page = MENU_PAGE_MODES;
                 } else if (s_menu_sel == 1) {
                     s_menu_page = MENU_PAGE_SETTINGS;
-                } else if (s_menu_sel == 2) {
-                    s_menu_page = MENU_PAGE_STATUS;
                 } else {
-                    s_menu_page = MENU_PAGE_DEVICES;
+                    s_menu_page = MENU_PAGE_STATUS;
                 }
                 s_menu_sel = (s_menu_page == MENU_PAGE_MODES) ? (uint8_t)s_mode : 0;
-                if (s_menu_page == MENU_PAGE_DEVICES) {
-                    s_menu_sel = ble_hid_get_selected_device_slot();
-                    s_device_pairing_blink = false;
-                    s_menu_f1_down_ms = now_ms;
-                    s_menu_f1_long_handled = true;
-                }
             } else if (s_menu_page == MENU_PAGE_MODES) {
                 s_mode = (app_mode_t)s_menu_sel;
                 nvs_save_mode((uint8_t)s_mode);
@@ -342,12 +264,24 @@ bool mode_manager_update(button_key_t key, uint32_t now_ms, mode_view_t *view, m
             } else if (s_menu_page == MENU_PAGE_SETTINGS) {
                 if (action != NULL) {
                     if (s_menu_sel == 0) {
+                        action->type = MODE_ACTION_DISCONNECT;
+                    } else if (s_menu_sel == 1) {
+                        action->type = MODE_ACTION_PAIRING_MODE;
+                    } else if (s_menu_sel == 2) {
                         action->type = MODE_ACTION_CLEAR_BONDS;
                     } else {
                         action->type = MODE_ACTION_WEB_START;
                     }
                 }
                 if (s_menu_sel == 0) {
+                    s_screen = APP_SCREEN_MODE;
+                    s_menu_page = MENU_PAGE_ROOT;
+                    s_last_action = "已断开";
+                } else if (s_menu_sel == 1) {
+                    s_screen = APP_SCREEN_MODE;
+                    s_menu_page = MENU_PAGE_ROOT;
+                    s_last_action = "配对模式";
+                } else if (s_menu_sel == 2) {
                     s_screen = APP_SCREEN_MODE;
                     s_menu_page = MENU_PAGE_ROOT;
                     s_mode = APP_MODE_DOUYIN_PC;
@@ -361,9 +295,6 @@ bool mode_manager_update(button_key_t key, uint32_t now_ms, mode_view_t *view, m
                 s_menu_sel = 0;
             } else if (s_menu_page == MENU_PAGE_WEB_CONTROL) {
                 s_menu_sel = 0;
-            } else if (s_menu_page == MENU_PAGE_DEVICES) {
-                s_menu_sel = 0;
-                s_device_pairing_blink = false;
             }
             changed = true;
         } else if (key == BUTTON_KEY_FUNC2 && key != s_last_key) {
@@ -382,7 +313,6 @@ bool mode_manager_update(button_key_t key, uint32_t now_ms, mode_view_t *view, m
             changed = true;
         } else if (key == BUTTON_KEY_UP && key != s_last_key) {
             if (s_menu_sel > 0) s_menu_sel--;
-            if (s_menu_page == MENU_PAGE_DEVICES) s_device_pairing_blink = false;
             changed = true;
         } else if (key == BUTTON_KEY_DOWN && key != s_last_key) {
             uint8_t max_sel = 0;
@@ -396,11 +326,8 @@ bool mode_manager_update(button_key_t key, uint32_t now_ms, mode_view_t *view, m
                 max_sel = 0;
             } else if (s_menu_page == MENU_PAGE_WEB_CONTROL) {
                 max_sel = 0;
-            } else if (s_menu_page == MENU_PAGE_DEVICES) {
-                max_sel = (sizeof(DEVICE_MENU_ITEMS) / sizeof(DEVICE_MENU_ITEMS[0])) - 1;
             }
             if (s_menu_sel < max_sel) s_menu_sel++;
-            if (s_menu_page == MENU_PAGE_DEVICES) s_device_pairing_blink = false;
             changed = true;
         }
         s_last_key = key;

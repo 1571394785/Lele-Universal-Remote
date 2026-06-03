@@ -44,6 +44,7 @@ esp_err_t ble_hid_keyboard_release(void);
 esp_err_t ble_hid_send_consumer(uint16_t usage);
 esp_err_t ble_hid_disconnect(void);
 esp_err_t ble_hid_enable_connection(void);
+esp_err_t ble_hid_enter_pairing_mode(void);
 esp_err_t ble_hid_clear_pairing(void);
 esp_err_t ble_hid_select_device_slot(uint8_t slot);
 esp_err_t ble_hid_connect_selected_device(void);

@@ -31,9 +31,9 @@
 #define BLE_HID_DRAG_STEPS 5
 #define BLE_HID_BATTERY_FIRST_NOTIFY_MS 1000
 #define BLE_HID_BATTERY_NOTIFY_INTERVAL_MS 60000
+#define BLE_HID_BATTERY_TASK_STACK 4096
 #define BLE_HID_DEVICE_NVS_NAMESPACE "bledev"
 #define BLE_HID_DEVICE_NVS_CURRENT "current"
-#define BLE_HID_DIRECT_ADV_MS 5000
 
 static const char *TAG = "ble_hid";
 static const char *DEVICE_NAME = "ESP32-HID";
@@ -45,7 +45,7 @@ static bool s_adv_config_done;
 static bool s_scan_rsp_config_done;
 static bool s_allow_auto_advertise;
 static bool s_pairing_discoverable;
-static bool s_direct_connect_pending;
+static bool s_slot_connect_pending;
 static uint8_t s_selected_device_slot;
 static ble_hid_device_slot_t s_device_slots[BLE_HID_DEVICE_SLOT_COUNT];
 static esp_bd_addr_t s_connected_bda;
@@ -169,7 +169,7 @@ static esp_ble_adv_data_t s_adv_data = {
     .p_service_data = NULL,
     .service_uuid_len = sizeof(s_hid_service_uuid),
     .p_service_uuid = s_hid_service_uuid,
-    .flag = ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT,
+    .flag = ESP_BLE_ADV_FLAG_BREDR_NOT_SPT,
 };
 
 static esp_ble_adv_data_t s_scan_rsp_data = {
@@ -183,16 +183,6 @@ static esp_ble_adv_params_t s_adv_params = {
     .adv_int_max = 0x30,
     .adv_type = ADV_TYPE_IND,
     .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
-    .channel_map = ADV_CHNL_ALL,
-    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
-};
-
-static esp_ble_adv_params_t s_direct_adv_params = {
-    .adv_int_min = 0x20,
-    .adv_int_max = 0x30,
-    .adv_type = ADV_TYPE_DIRECT_IND_LOW,
-    .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
-    .peer_addr_type = BLE_ADDR_TYPE_PUBLIC,
     .channel_map = ADV_CHNL_ALL,
     .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
@@ -282,10 +272,14 @@ static void stop_advertising_now(void)
     }
 }
 
-static bool addr_is_selected_slot(const uint8_t addr[6])
+static esp_err_t configure_discoverable(bool discoverable)
 {
-    ble_hid_device_slot_t *slot = &s_device_slots[s_selected_device_slot];
-    return slot->valid && memcmp(slot->addr, addr, 6) == 0;
+    s_adv_data.flag = ESP_BLE_ADV_FLAG_BREDR_NOT_SPT;
+    if (discoverable) {
+        s_adv_data.flag |= ESP_BLE_ADV_FLAG_GEN_DISC;
+    }
+    s_adv_config_done = false;
+    return esp_ble_gap_config_adv_data(&s_adv_data);
 }
 
 static bool addr_is_any_slot(const uint8_t addr[6])
@@ -298,59 +292,27 @@ static bool addr_is_any_slot(const uint8_t addr[6])
     return false;
 }
 
-static bool addr_is_other_slot(const uint8_t addr[6])
+static bool has_bond_device(void)
 {
-    for (uint8_t i = 0; i < BLE_HID_DEVICE_SLOT_COUNT; i++) {
-        if (i != s_selected_device_slot &&
-            s_device_slots[i].valid && memcmp(s_device_slots[i].addr, addr, 6) == 0) {
-            return true;
-        }
-    }
-    return false;
+    return esp_ble_get_bond_device_num() > 0;
 }
 
 static bool addr_is_allowed_for_security(const uint8_t addr[6])
 {
-    if (addr_is_selected_slot(addr)) {
+    if (s_pairing_discoverable || addr_is_any_slot(addr)) {
         return true;
     }
-    if (s_pairing_discoverable && !addr_is_other_slot(addr)) {
-        return true;
-    }
-    return false;
-}
 
-static void remove_bonds_not_in_slots(void)
-{
-    int dev_num = esp_ble_get_bond_device_num();
-    if (dev_num <= 0) {
-        return;
-    }
-
-    esp_ble_bond_dev_t bonds[dev_num];
-    if (esp_ble_get_bond_device_list(&dev_num, bonds) != ESP_OK) {
-        return;
-    }
-
-    for (int i = 0; i < dev_num; i++) {
-        if (!addr_is_any_slot(bonds[i].bd_addr)) {
-            esp_ble_remove_bond_device(bonds[i].bd_addr);
-        }
-    }
+    return has_bond_device();
 }
 
 static void start_advertising_if_ready(void)
 {
-    if (s_direct_connect_pending && s_adv_config_done && s_scan_rsp_config_done && !s_advertising) {
-        ble_hid_device_slot_t *slot = &s_device_slots[s_selected_device_slot];
-        if (slot->valid) {
-            memcpy(s_direct_adv_params.peer_addr, slot->addr, 6);
-            s_direct_adv_params.peer_addr_type = (esp_ble_addr_type_t)slot->addr_type;
-            if (esp_ble_gap_start_advertising(&s_direct_adv_params) == ESP_OK) {
-                s_advertising = true;
-            }
+    if (s_slot_connect_pending && s_adv_config_done && s_scan_rsp_config_done && !s_advertising) {
+        if (has_bond_device()) {
+            esp_ble_gap_start_advertising(&s_adv_params);
         }
-        s_direct_connect_pending = false;
+        s_slot_connect_pending = false;
         return;
     }
 
@@ -481,6 +443,11 @@ static void hidd_event_callback(void *handler_args, esp_event_base_t base, int32
     switch (id) {
     case ESP_HIDD_START_EVENT:
         ESP_LOGI(TAG, "HID started");
+        if (!s_pairing_discoverable && has_bond_device()) {
+            s_allow_auto_advertise = true;
+            s_slot_connect_pending = true;
+            configure_discoverable(false);
+        }
         start_advertising_if_ready();
         break;
 
@@ -498,6 +465,9 @@ static void hidd_event_callback(void *handler_args, esp_event_base_t base, int32
         memset(s_connected_bda, 0, sizeof(s_connected_bda));
         s_connected_addr[0] = '\0';
         ESP_LOGI(TAG, "disconnected");
+        if (!s_pairing_discoverable && s_allow_auto_advertise && has_bond_device()) {
+            s_slot_connect_pending = true;
+        }
         start_advertising_if_ready();
         break;
 
@@ -522,7 +492,7 @@ esp_err_t ble_hid_init(void)
     load_device_slots();
     s_allow_auto_advertise = false;
     s_pairing_discoverable = false;
-    s_direct_connect_pending = s_device_slots[s_selected_device_slot].valid;
+    s_slot_connect_pending = false;
 
     esp_err_t event_ret = esp_event_loop_create_default();
     if (event_ret != ESP_OK && event_ret != ESP_ERR_INVALID_STATE) {
@@ -551,7 +521,6 @@ esp_err_t ble_hid_init(void)
     ESP_RETURN_ON_ERROR(esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(key_size)), TAG, "key size param failed");
     ESP_RETURN_ON_ERROR(esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(init_key)), TAG, "init key param failed");
     ESP_RETURN_ON_ERROR(esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(rsp_key)), TAG, "rsp key param failed");
-    remove_bonds_not_in_slots();
 
     ESP_RETURN_ON_ERROR(esp_ble_gap_config_adv_data(&s_adv_data), TAG, "adv data config failed");
     ESP_RETURN_ON_ERROR(esp_ble_gap_config_adv_data(&s_scan_rsp_data), TAG, "scan rsp config failed");
@@ -563,7 +532,7 @@ esp_err_t ble_hid_init(void)
     }
 
     if (s_battery_task == NULL) {
-        BaseType_t task_ret = xTaskCreate(battery_notify_task, "battery_notify", 2048, NULL, 5, &s_battery_task);
+        BaseType_t task_ret = xTaskCreate(battery_notify_task, "battery_notify", BLE_HID_BATTERY_TASK_STACK, NULL, 5, &s_battery_task);
         if (task_ret != pdPASS) {
             return ESP_ERR_NO_MEM;
         }
@@ -654,7 +623,7 @@ esp_err_t ble_hid_disconnect(void)
     if (!s_connected) {
         s_allow_auto_advertise = false;
         s_pairing_discoverable = false;
-        s_direct_connect_pending = false;
+        s_slot_connect_pending = false;
         stop_advertising_now();
         ESP_LOGI(TAG, "disconnect ignored (not connected)");
         return ESP_OK;
@@ -662,7 +631,7 @@ esp_err_t ble_hid_disconnect(void)
 
     s_allow_auto_advertise = false;
     s_pairing_discoverable = false;
-    s_direct_connect_pending = false;
+    s_slot_connect_pending = false;
     esp_err_t ret = esp_ble_gap_disconnect(s_connected_bda);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "disconnect failed: %s", esp_err_to_name(ret));
@@ -716,67 +685,59 @@ bool ble_hid_is_pairing_mode(void)
 
 esp_err_t ble_hid_connect_selected_device(void)
 {
-    s_allow_auto_advertise = false;
+    s_allow_auto_advertise = true;
     s_pairing_discoverable = false;
-    s_direct_connect_pending = false;
+    s_slot_connect_pending = false;
     stop_advertising_now();
 
     if (s_connected) {
-        ESP_RETURN_ON_ERROR(ble_hid_disconnect(), TAG, "disconnect before slot switch failed");
-        vTaskDelay(pdMS_TO_TICKS(150));
-    }
-
-    if (!s_adv_config_done || !s_scan_rsp_config_done) {
-        s_direct_connect_pending = true;
-        ESP_LOGI(TAG, "direct advertising pending adv config");
+        ESP_LOGI(TAG, "connection already active");
         return ESP_OK;
     }
 
-    ble_hid_device_slot_t *slot = &s_device_slots[s_selected_device_slot];
-    if (!slot->valid) {
-        ESP_LOGI(TAG, "selected device slot %u is empty", (unsigned)(s_selected_device_slot + 1));
+    if (!has_bond_device()) {
+        ESP_LOGI(TAG, "no bonded device to connect");
         return ESP_OK;
     }
 
-    memcpy(s_direct_adv_params.peer_addr, slot->addr, 6);
-    s_direct_adv_params.peer_addr_type = (esp_ble_addr_type_t)slot->addr_type;
-    esp_err_t ret = esp_ble_gap_start_advertising(&s_direct_adv_params);
-    if (ret == ESP_OK) {
-        s_advertising = true;
-    }
-    ESP_LOGI(TAG, "direct advertising for slot %u", (unsigned)(s_selected_device_slot + 1));
-    return ret;
+    ESP_RETURN_ON_ERROR(configure_discoverable(false), TAG, "config connection advertising failed");
+    s_slot_connect_pending = true;
+    start_advertising_if_ready();
+    ESP_LOGI(TAG, "connection advertising for bonded device");
+    return ESP_OK;
 }
 
-esp_err_t ble_hid_pair_selected_device(void)
+esp_err_t ble_hid_enter_pairing_mode(void)
 {
     if (s_connected) {
         ESP_RETURN_ON_ERROR(ble_hid_disconnect(), TAG, "disconnect before pairing failed");
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    ble_hid_device_slot_t *slot = &s_device_slots[s_selected_device_slot];
-    if (slot->valid) {
-        remove_bond_for_addr(slot->addr);
-        memset(slot, 0, sizeof(*slot));
-        save_device_slot(s_selected_device_slot);
+    int dev_num = esp_ble_get_bond_device_num();
+    if (dev_num > 0) {
+        esp_ble_bond_dev_t bonds[dev_num];
+        ESP_RETURN_ON_ERROR(esp_ble_get_bond_device_list(&dev_num, bonds), TAG, "get bond list failed");
+        for (int i = 0; i < dev_num; i++) {
+            esp_ble_remove_bond_device(bonds[i].bd_addr);
+        }
     }
+    memset(s_device_slots, 0, sizeof(s_device_slots));
+    save_device_slot(0);
 
     s_pairing_discoverable = true;
     s_allow_auto_advertise = true;
-    s_direct_connect_pending = false;
+    s_slot_connect_pending = false;
     stop_advertising_now();
-    if (!s_adv_config_done || !s_scan_rsp_config_done) {
-        ESP_LOGI(TAG, "pairing mode pending adv config");
-        return ESP_OK;
-    }
+    ESP_RETURN_ON_ERROR(configure_discoverable(true), TAG, "config pairing advertising failed");
+    start_advertising_if_ready();
+    ESP_LOGI(TAG, "pairing mode enabled");
+    return ESP_OK;
+}
 
-    esp_err_t ret = esp_ble_gap_start_advertising(&s_adv_params);
-    if (ret == ESP_OK) {
-        s_advertising = true;
-    }
-    ESP_LOGI(TAG, "pairing mode for slot %u", (unsigned)(s_selected_device_slot + 1));
-    return ret;
+esp_err_t ble_hid_pair_selected_device(void)
+{
+    return ble_hid_enter_pairing_mode();
 }
 
 esp_err_t ble_hid_clear_pairing(void)
@@ -786,6 +747,7 @@ esp_err_t ble_hid_clear_pairing(void)
 
     s_allow_auto_advertise = false;
     s_pairing_discoverable = false;
+    s_slot_connect_pending = false;
     if (s_connected && ble_hid_disconnect() != ESP_OK) {
         ESP_LOGW(TAG, "disconnect before clear failed");
     }

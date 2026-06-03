@@ -96,8 +96,6 @@ void app_main(void)
     bool prev_connected = false;
     uint32_t last_status_refresh_ms = 0;
     uint32_t last_header_refresh_ms = 0;
-    uint32_t last_device_blink_ms = 0;
-    bool device_blink_on = true;
 
     while (true) {
         button_key_t key = buttons_poll();
@@ -108,15 +106,9 @@ void app_main(void)
         bool status_refresh = view.screen == APP_SCREEN_MENU && view.show_status &&
                               now_ms - last_status_refresh_ms >= 1000;
         bool header_refresh = view.screen == APP_SCREEN_MODE && now_ms - last_header_refresh_ms >= 1000;
-        bool device_blink_refresh = view.screen == APP_SCREEN_MENU && view.show_devices && view.blink_selected &&
-                                    now_ms - last_device_blink_ms >= 300;
 
         if (mode_manager_update(key, now_ms, &view, &action) || connected != prev_connected ||
-            status_refresh || header_refresh || device_blink_refresh) {
-            if (device_blink_refresh) {
-                device_blink_on = !device_blink_on;
-                last_device_blink_ms = now_ms;
-            }
+            status_refresh || header_refresh) {
             ESP_ERROR_CHECK(ssd1306_clear());
 
             if (view.screen == APP_SCREEN_MENU) {
@@ -161,13 +153,11 @@ void app_main(void)
 
                     for (uint8_t i = 0; i < vis && start + i < view.item_count; i++) {
                         uint8_t idx = start + i;
-                        if (!(view.blink_selected && idx == view.selected && !device_blink_on)) {
-                            ESP_ERROR_CHECK(ssd1306_draw_text16(base_page + i * 2, 0, view.items[idx]));
-                        }
+                        ESP_ERROR_CHECK(ssd1306_draw_text16(base_page + i * 2, 0, view.items[idx]));
                     }
 
                     // 选中行反色
-                    if (view.item_count > 0 && !(view.blink_selected && !device_blink_on)) {
+                    if (view.item_count > 0) {
                         uint8_t sel_pos = view.selected - start;
                         ESP_ERROR_CHECK(ssd1306_invert_area(base_page + sel_pos * 2, base_page + 2 + sel_pos * 2, 0, OLED_WIDTH));
                     }
@@ -213,6 +203,10 @@ void app_main(void)
             ESP_ERROR_CHECK(ble_hid_drag_vertical(action.value > 0));
         } else if (action.type == MODE_ACTION_MEDIA) {
             ESP_ERROR_CHECK(ble_hid_send_consumer((uint16_t)action.value));
+        } else if (action.type == MODE_ACTION_DISCONNECT) {
+            ESP_ERROR_CHECK(ble_hid_disconnect());
+        } else if (action.type == MODE_ACTION_PAIRING_MODE) {
+            ESP_ERROR_CHECK(ble_hid_enter_pairing_mode());
         } else if (action.type == MODE_ACTION_CLEAR_BONDS) {
             ESP_ERROR_CHECK(ble_hid_clear_pairing());
             ESP_ERROR_CHECK(custom_mode_clear_all());
@@ -220,12 +214,6 @@ void app_main(void)
             ESP_ERROR_CHECK(web_control_start());
         } else if (action.type == MODE_ACTION_WEB_STOP) {
             ESP_ERROR_CHECK(web_control_stop());
-        } else if (action.type == MODE_ACTION_DEVICE_CONNECT) {
-            ESP_ERROR_CHECK(ble_hid_select_device_slot((uint8_t)action.value));
-            ESP_ERROR_CHECK(ble_hid_connect_selected_device());
-        } else if (action.type == MODE_ACTION_DEVICE_PAIR) {
-            ESP_ERROR_CHECK(ble_hid_select_device_slot((uint8_t)action.value));
-            ESP_ERROR_CHECK(ble_hid_pair_selected_device());
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
