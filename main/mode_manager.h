@@ -5,8 +5,8 @@
 
 #include "buttons.h"
 
-#define MODE_COUNT 6
-#define MENU_ITEM_MAX 6
+#define MODE_COUNT 7
+#define MENU_ITEM_MAX 7
 
 typedef enum {
     APP_SCREEN_MODE = 0,
@@ -25,6 +25,8 @@ typedef struct {
     bool show_devices;         // show device slot list
     bool blink_selected;       // blink current selected menu item
     bool is_gamepad_mode;      // current mode is BLE gamepad
+    bool is_mouse_mode;        // current mode is relative mouse
+    bool is_temporary_mouse;   // return to previous mode with F2
     bool show_scrollbar;       // menu has more rows than visible area
     uint8_t selected;           // current selection in menu
     uint8_t item_count;         // number of menu items
@@ -34,12 +36,18 @@ typedef struct {
 typedef enum {
     MODE_ACTION_NONE = 0,
     MODE_ACTION_KEYBOARD_KEY,
+    MODE_ACTION_KEYBOARD_PRESS,
+    MODE_ACTION_KEYBOARD_RELEASE,
     MODE_ACTION_ABS_MOUSE_DRAG,
     MODE_ACTION_MEDIA,
     MODE_ACTION_DISCONNECT,
     MODE_ACTION_PAIRING_MODE,
     MODE_ACTION_CLEAR_BONDS,
     MODE_ACTION_HID_MODE_TOGGLE,
+    MODE_ACTION_GAME_TETRIS,
+    MODE_ACTION_GAME_SHOOTER,
+    MODE_ACTION_GAME_BREAKOUT,
+    MODE_ACTION_GAME_SNAKE,
     MODE_ACTION_WEB_START,
     MODE_ACTION_WEB_STOP,
     MODE_ACTION_CUSTOM_SHORTCUT_TAP,

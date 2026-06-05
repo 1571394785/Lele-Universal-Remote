@@ -7,9 +7,8 @@
 #include "nvs.h"
 
 #define CUSTOM_MODE_NAMESPACE "custom"
-#define SHORTCUT_MAX_LEN 31
 
-static char s_shortcuts[BUTTON_KEY_COUNT][SHORTCUT_MAX_LEN + 1];
+static char s_shortcuts[BUTTON_KEY_COUNT][CUSTOM_SHORTCUT_MAX_LEN + 1];
 
 static const char *key_nvs_name(button_key_t key)
 {
@@ -222,7 +221,7 @@ esp_err_t custom_mode_set_shortcut(button_key_t key, const char *shortcut)
         return ESP_ERR_INVALID_ARG;
     }
 
-    size_t len = strnlen(shortcut, SHORTCUT_MAX_LEN);
+    size_t len = strnlen(shortcut, CUSTOM_SHORTCUT_MAX_LEN);
     memcpy(s_shortcuts[key], shortcut, len);
     s_shortcuts[key][len] = '\0';
 

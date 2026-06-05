@@ -586,6 +586,46 @@ esp_err_t ssd1306_draw_text24(int y, int col, const char *text)
     return ESP_OK;
 }
 
+esp_err_t ssd1306_draw_pixel(int x, int y, bool on)
+{
+    draw_pixel(x, y, on);
+    return ESP_OK;
+}
+
+esp_err_t ssd1306_draw_pixel_ccw(int x, int y, bool on)
+{
+    draw_pixel_ccw(x, y, on);
+    return ESP_OK;
+}
+
+esp_err_t ssd1306_fill_rect(int x, int y, int w, int h, bool on)
+{
+    if (w <= 0 || h <= 0) {
+        return ESP_OK;
+    }
+
+    for (int py = y; py < y + h; py++) {
+        for (int px = x; px < x + w; px++) {
+            draw_pixel(px, py, on);
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t ssd1306_fill_rect_ccw(int x, int y, int w, int h, bool on)
+{
+    if (w <= 0 || h <= 0) {
+        return ESP_OK;
+    }
+
+    for (int py = y; py < y + h; py++) {
+        for (int px = x; px < x + w; px++) {
+            draw_pixel_ccw(px, py, on);
+        }
+    }
+    return ESP_OK;
+}
+
 esp_err_t ssd1306_draw_bluetooth_icon(int page, int col, bool connected)
 {
     if (page < 0 || page + 1 >= OLED_HEIGHT / 8 || col < 0 || col + 16 > OLED_WIDTH) {

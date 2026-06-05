@@ -58,6 +58,7 @@ bool ble_hid_is_pairing_mode(void);
 
 /** Execute a mouse motion pipeline defined by steps array */
 esp_err_t ble_hid_mouse_exec(const mouse_step_t *steps, size_t count);
+esp_err_t ble_hid_send_mouse_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel);
 
 /** Convenience: vertical scroll with center-positioning preamble */
 esp_err_t ble_hid_drag_vertical(bool upward);

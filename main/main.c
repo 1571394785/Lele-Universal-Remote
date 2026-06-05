@@ -1,7 +1,9 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "app_display.h"
+#include "app_games.h"
 #include "app_gamepad.h"
+#include "app_mouse.h"
 #include "battery_adc.h"
 #include "ble_hid.h"
 #include "buttons.h"
@@ -64,6 +66,10 @@ void app_main(void)
     uint32_t last_header_refresh_ms = 0;
     app_gamepad_state_t gamepad = {0};
     app_gamepad_state_init(&gamepad);
+    app_game_state_t game_state = {0};
+    app_games_init(&game_state);
+    app_mouse_state_t mouse = {0};
+    app_mouse_state_init(&mouse);
 
     while (true) {
         uint16_t button_mask = buttons_poll_mask();
@@ -72,6 +78,20 @@ void app_main(void)
         bool connected = ble_hid_is_connected();
         const char *addr = ble_hid_get_connected_addr();
         bool manager_changed = false;
+
+        if (app_games_is_running(&game_state)) {
+            bool exit_game = false;
+            ESP_ERROR_CHECK(app_games_update(&game_state, button_mask, now_ms, &exit_game));
+            if (exit_game) {
+                mode_manager_enter_menu(&view);
+                ESP_ERROR_CHECK(app_display_render_view(&view, connected, addr, now_ms,
+                                                        &last_status_refresh_ms,
+                                                        &last_header_refresh_ms));
+                prev_connected = connected;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
 
         action.type = MODE_ACTION_NONE;
         action.value = 0;
@@ -85,6 +105,15 @@ void app_main(void)
             app_gamepad_filter_menu_key(&gamepad, button_mask, &key);
             manager_changed = mode_manager_update(key, now_ms, &view, &action);
             app_gamepad_reset_if_inactive(&gamepad, &view);
+        }
+
+        if (view.screen == APP_SCREEN_MODE && view.is_mouse_mode) {
+            if (!mouse.active) {
+                app_mouse_enter(&mouse, button_mask);
+            }
+            ESP_ERROR_CHECK(app_mouse_handle(&mouse, button_mask, now_ms));
+        } else if (mouse.active) {
+            ESP_ERROR_CHECK(app_mouse_leave(&mouse));
         }
 
         bool status_refresh = view.screen == APP_SCREEN_MENU && view.show_status &&
@@ -104,6 +133,10 @@ void app_main(void)
         }
         if (action.type == MODE_ACTION_KEYBOARD_KEY) {
             ESP_ERROR_CHECK(ble_hid_send_key_combo(action.modifier, (uint8_t)action.value));
+        } else if (action.type == MODE_ACTION_KEYBOARD_PRESS) {
+            ESP_ERROR_CHECK(ble_hid_keyboard_press(action.modifier, (uint8_t)action.value));
+        } else if (action.type == MODE_ACTION_KEYBOARD_RELEASE) {
+            ESP_ERROR_CHECK(ble_hid_keyboard_release());
         } else if (action.type == MODE_ACTION_CUSTOM_SHORTCUT_TAP ||
                    action.type == MODE_ACTION_CUSTOM_SHORTCUT_PRESS) {
             custom_key_combo_t sequence[CUSTOM_SEQUENCE_MAX];
@@ -133,11 +166,19 @@ void app_main(void)
             ESP_ERROR_CHECK(custom_mode_clear_all());
         } else if (action.type == MODE_ACTION_HID_MODE_TOGGLE) {
             ESP_ERROR_CHECK(ble_hid_toggle_hid_mode());
+        } else if (action.type == MODE_ACTION_GAME_TETRIS) {
+            app_games_start(&game_state, APP_GAME_TETRIS, now_ms);
+        } else if (action.type == MODE_ACTION_GAME_SHOOTER) {
+            app_games_start(&game_state, APP_GAME_SHOOTER, now_ms);
+        } else if (action.type == MODE_ACTION_GAME_BREAKOUT) {
+            app_games_start(&game_state, APP_GAME_BREAKOUT, now_ms);
+        } else if (action.type == MODE_ACTION_GAME_SNAKE) {
+            app_games_start(&game_state, APP_GAME_SNAKE, now_ms);
         } else if (action.type == MODE_ACTION_WEB_START) {
             ESP_ERROR_CHECK(web_control_start());
         } else if (action.type == MODE_ACTION_WEB_STOP) {
             ESP_ERROR_CHECK(web_control_stop());
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }

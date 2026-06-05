@@ -37,6 +37,7 @@
 #define BLE_HID_DEVICE_NVS_NAMESPACE "bledev"
 #define BLE_HID_DEVICE_NVS_CURRENT "current"
 #define BLE_HID_DEVICE_NVS_FULL_MODE "fullmode"
+#define BLE_HID_DEVICE_NVS_OWN_ADDR "randaddr"
 
 static const char *TAG = "ble_hid";
 static const char *DEVICE_NAME = "乐乐牌遥控器";
@@ -57,6 +58,8 @@ static TaskHandle_t s_battery_task;
 static TickType_t s_next_battery_notify_tick;
 static uint8_t s_last_battery_level;
 static bool s_full_hid_mode;
+static bool s_have_random_addr;
+static esp_bd_addr_t s_random_addr;
 
 static uint8_t s_hid_service_uuid[] = {
     0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
@@ -330,6 +333,51 @@ static void load_hid_mode(void)
     s_hid_report_maps[0].data = s_full_hid_mode ? HID_REPORT_MAP_FULL : HID_REPORT_MAP_COMPAT;
     s_hid_report_maps[0].len = s_full_hid_mode ? sizeof(HID_REPORT_MAP_FULL) : sizeof(HID_REPORT_MAP_COMPAT);
     ESP_LOGI(TAG, "HID mode: %s", s_full_hid_mode ? "full" : "compatible");
+}
+
+static void load_own_address(void)
+{
+    nvs_handle_t h;
+    size_t len = sizeof(s_random_addr);
+    s_have_random_addr = false;
+
+    if (nvs_open(BLE_HID_DEVICE_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_blob(h, BLE_HID_DEVICE_NVS_OWN_ADDR, s_random_addr, &len) == ESP_OK &&
+            len == sizeof(s_random_addr)) {
+            s_have_random_addr = true;
+            s_adv_params.own_addr_type = BLE_ADDR_TYPE_RANDOM;
+        }
+        nvs_close(h);
+    }
+}
+
+static esp_err_t save_own_address(void)
+{
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(BLE_HID_DEVICE_NVS_NAMESPACE, NVS_READWRITE, &h),
+                        TAG, "open own address nvs failed");
+    esp_err_t ret = nvs_set_blob(h, BLE_HID_DEVICE_NVS_OWN_ADDR, s_random_addr,
+                                 sizeof(s_random_addr));
+    if (ret == ESP_OK) {
+        ret = nvs_commit(h);
+    }
+    nvs_close(h);
+    return ret;
+}
+
+static esp_err_t generate_new_own_address(void)
+{
+    ESP_RETURN_ON_ERROR(esp_ble_gap_addr_create_static(s_random_addr),
+                        TAG, "create static random address failed");
+    ESP_RETURN_ON_ERROR(save_own_address(), TAG, "save static random address failed");
+    ESP_RETURN_ON_ERROR(esp_ble_gap_set_rand_addr(s_random_addr),
+                        TAG, "set static random address failed");
+    s_have_random_addr = true;
+    s_adv_params.own_addr_type = BLE_ADDR_TYPE_RANDOM;
+    ESP_LOGI(TAG, "new pairing identity: %02x:%02x:%02x:%02x:%02x:%02x",
+             s_random_addr[0], s_random_addr[1], s_random_addr[2],
+             s_random_addr[3], s_random_addr[4], s_random_addr[5]);
+    return ESP_OK;
 }
 
 static esp_err_t save_hid_mode(bool full_mode)
@@ -617,6 +665,7 @@ esp_err_t ble_hid_init(void)
     ESP_RETURN_ON_ERROR(init_nvs(), TAG, "nvs init failed");
     load_device_slots();
     load_hid_mode();
+    load_own_address();
     s_allow_auto_advertise = false;
     s_pairing_discoverable = false;
     s_slot_connect_pending = false;
@@ -633,6 +682,10 @@ esp_err_t ble_hid_init(void)
     ESP_RETURN_ON_ERROR(esp_bt_controller_enable(ESP_BT_MODE_BLE), TAG, "bt controller enable failed");
     ESP_RETURN_ON_ERROR(esp_bluedroid_init(), TAG, "bluedroid init failed");
     ESP_RETURN_ON_ERROR(esp_bluedroid_enable(), TAG, "bluedroid enable failed");
+    if (s_have_random_addr) {
+        ESP_RETURN_ON_ERROR(esp_ble_gap_set_rand_addr(s_random_addr),
+                            TAG, "restore static random address failed");
+    }
 
     ESP_RETURN_ON_ERROR(esp_ble_gap_register_callback(gap_event_handler), TAG, "gap callback failed");
     ESP_RETURN_ON_ERROR(esp_ble_gatts_register_callback(esp_hidd_gatts_event_handler), TAG, "gatts callback failed");
@@ -870,6 +923,9 @@ esp_err_t ble_hid_enter_pairing_mode(void)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
+    stop_advertising_now();
+    vTaskDelay(pdMS_TO_TICKS(100));
+
     int dev_num = esp_ble_get_bond_device_num();
     if (dev_num > 0) {
         esp_ble_bond_dev_t bonds[dev_num];
@@ -879,12 +935,17 @@ esp_err_t ble_hid_enter_pairing_mode(void)
         }
     }
     memset(s_device_slots, 0, sizeof(s_device_slots));
-    save_device_slot(0);
+    s_selected_device_slot = 0;
+    save_selected_slot();
+    for (uint8_t i = 0; i < BLE_HID_DEVICE_SLOT_COUNT; i++) {
+        save_device_slot(i);
+    }
+
+    ESP_RETURN_ON_ERROR(generate_new_own_address(), TAG, "change identity for pairing failed");
 
     s_pairing_discoverable = true;
     s_allow_auto_advertise = true;
     s_slot_connect_pending = false;
-    stop_advertising_now();
     ESP_RETURN_ON_ERROR(configure_discoverable(true), TAG, "config pairing advertising failed");
     start_advertising_if_ready();
     ESP_LOGI(TAG, "pairing mode enabled");
@@ -931,16 +992,16 @@ esp_err_t ble_hid_clear_pairing(void)
     return ESP_OK;
 }
 
-static esp_err_t send_mouse_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel)
+esp_err_t ble_hid_send_mouse_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel)
 {
     if (!s_connected || s_hid_dev == NULL) {
-        ESP_LOGW(TAG, "mouse report dropped (not connected)");
+        ESP_LOGD(TAG, "mouse report dropped (not connected)");
         return ESP_OK;
     }
 
     uint8_t report[4] = {buttons, (uint8_t)dx, (uint8_t)dy, (uint8_t)wheel};
 
-    ESP_LOGI(TAG, "mouse buttons=%u dx=%d dy=%d wheel=%d", buttons, dx, dy, wheel);
+    ESP_LOGD(TAG, "mouse buttons=%u dx=%d dy=%d wheel=%d", buttons, dx, dy, wheel);
     esp_err_t ret = esp_hidd_dev_input_set(s_hid_dev, BLE_HID_REPORT_MAP_INDEX, BLE_HID_MOUSE_REPORT_ID, report, sizeof(report));
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "mouse report failed: %s", esp_err_to_name(ret));
@@ -984,7 +1045,7 @@ esp_err_t ble_hid_mouse_exec(const mouse_step_t *steps, size_t count)
         switch (s->type) {
         case MOUSE_STEP_MOVE:
             for (uint8_t r = 0; r < s->repeat; r++) {
-                ESP_RETURN_ON_ERROR(send_mouse_report(s->buttons, s->dx, s->dy, 0),
+                ESP_RETURN_ON_ERROR(ble_hid_send_mouse_report(s->buttons, s->dx, s->dy, 0),
                                     TAG, "move step[%u] failed", (unsigned)i);
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
@@ -992,14 +1053,14 @@ esp_err_t ble_hid_mouse_exec(const mouse_step_t *steps, size_t count)
 
         case MOUSE_STEP_SCROLL:
             for (uint8_t r = 0; r < s->repeat; r++) {
-                ESP_RETURN_ON_ERROR(send_mouse_report(s->buttons, 0, 0, s->wheel),
+                ESP_RETURN_ON_ERROR(ble_hid_send_mouse_report(s->buttons, 0, 0, s->wheel),
                                     TAG, "scroll step[%u] failed", (unsigned)i);
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
             break;
 
         case MOUSE_STEP_RESET:
-            ESP_RETURN_ON_ERROR(send_mouse_report(0, 0, 0, 0),
+            ESP_RETURN_ON_ERROR(ble_hid_send_mouse_report(0, 0, 0, 0),
                                 TAG, "reset step[%u] failed", (unsigned)i);
             break;
 

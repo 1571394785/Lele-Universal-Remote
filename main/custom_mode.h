@@ -16,7 +16,8 @@ typedef struct {
     uint8_t keycode;
 } custom_key_combo_t;
 
-#define CUSTOM_SEQUENCE_MAX 16
+#define CUSTOM_SHORTCUT_MAX_LEN 127
+#define CUSTOM_SEQUENCE_MAX 128
 
 esp_err_t custom_mode_init(void);
 esp_err_t custom_mode_set_shortcut(button_key_t key, const char *shortcut);

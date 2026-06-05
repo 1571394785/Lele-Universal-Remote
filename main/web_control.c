@@ -1,6 +1,7 @@
 #include "web_control.h"
 
 #include <ctype.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 
@@ -20,6 +21,7 @@
 #define WEB_AP_PASSWORD ""
 #define WEB_AP_CHANNEL 6
 #define DNS_PORT 53
+#define WEB_SAVE_BODY_MAX 4096
 
 static const char *TAG = "web_control";
 
@@ -52,44 +54,45 @@ static int hex_value(char c)
     return -1;
 }
 
-static void url_decode(char *text)
+static void url_decode_range(char *dst, size_t dst_len, const char *src, size_t src_len)
 {
-    char *src = text;
-    char *dst = text;
-    while (*src != '\0') {
-        if (*src == '+') {
-            *dst++ = ' ';
-            src++;
-        } else if (*src == '%' && isxdigit((unsigned char)src[1]) && isxdigit((unsigned char)src[2])) {
-            *dst++ = (char)((hex_value(src[1]) << 4) | hex_value(src[2]));
-            src += 3;
+    size_t used = 0;
+    size_t pos = 0;
+    while (pos < src_len && used + 1 < dst_len) {
+        if (src[pos] == '+') {
+            dst[used++] = ' ';
+            pos++;
+        } else if (src[pos] == '%' && pos + 2 < src_len &&
+                   isxdigit((unsigned char)src[pos + 1]) &&
+                   isxdigit((unsigned char)src[pos + 2])) {
+            dst[used++] = (char)((hex_value(src[pos + 1]) << 4) | hex_value(src[pos + 2]));
+            pos += 3;
         } else {
-            *dst++ = *src++;
+            dst[used++] = src[pos++];
         }
     }
-    *dst = '\0';
+    dst[used] = '\0';
 }
 
-static const char *find_param(char *body, const char *name)
+static bool find_param(const char *body, const char *name, char *value, size_t value_len)
 {
     size_t name_len = strlen(name);
-    char *p = body;
+    const char *p = body;
     while (p != NULL && *p != '\0') {
         if (strncmp(p, name, name_len) == 0 && p[name_len] == '=') {
-            char *value = p + name_len + 1;
-            char *end = strchr(value, '&');
-            if (end != NULL) {
-                *end = '\0';
-            }
-            url_decode(value);
-            return value;
+            const char *start = p + name_len + 1;
+            const char *end = strchr(start, '&');
+            size_t len = end != NULL ? (size_t)(end - start) : strlen(start);
+            url_decode_range(value, value_len, start, len);
+            return true;
         }
         p = strchr(p, '&');
         if (p != NULL) {
             p++;
         }
     }
-    return "";
+    value[0] = '\0';
+    return false;
 }
 
 static void html_attr_escape(char *dst, size_t dst_len, const char *src)
@@ -132,13 +135,13 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         ".hint{color:#aaa;font-size:13px;line-height:1.5}</style></head><body><main>"
         "<h1>自定义模式</h1><form method='post' action='/save'>");
 
-    char row[256];
+    char row[800];
     for (size_t i = 0; i < sizeof(WEB_KEYS) / sizeof(WEB_KEYS[0]); i++) {
-        char value[96];
+        char value[CUSTOM_SHORTCUT_MAX_LEN * 5 + 1];
         html_attr_escape(value, sizeof(value), custom_mode_get_shortcut(WEB_KEYS[i]));
         snprintf(row, sizeof(row),
-                 "<div class='row'><label>%s</label><input name='%s' value='%s' placeholder='ctrl+c'></div>",
-                 WEB_KEY_LABELS[i], WEB_KEY_IDS[i], value);
+                 "<div class='row'><label>%s</label><input name='%s' maxlength='%d' value='%s' placeholder='ctrl+c'></div>",
+                 WEB_KEY_LABELS[i], WEB_KEY_IDS[i], CUSTOM_SHORTCUT_MAX_LEN, value);
         httpd_resp_sendstr_chunk(req, row);
     }
 
@@ -152,12 +155,23 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
 static esp_err_t save_post_handler(httpd_req_t *req)
 {
-    char body[512] = {0};
+    if (req->content_len <= 0 || req->content_len >= WEB_SAVE_BODY_MAX) {
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "Save data is too large");
+        return ESP_FAIL;
+    }
+
+    char *body = calloc((size_t)req->content_len + 1, 1);
+    if (body == NULL) {
+        httpd_resp_send_500(req);
+        return ESP_ERR_NO_MEM;
+    }
+
     int remaining = req->content_len;
     int offset = 0;
-    while (remaining > 0 && offset < (int)sizeof(body) - 1) {
-        int ret = httpd_req_recv(req, body + offset, sizeof(body) - 1 - offset);
+    while (remaining > 0) {
+        int ret = httpd_req_recv(req, body + offset, remaining);
         if (ret <= 0) {
+            free(body);
             return ESP_FAIL;
         }
         offset += ret;
@@ -166,10 +180,11 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     body[offset] = '\0';
 
     for (size_t i = 0; i < sizeof(WEB_KEYS) / sizeof(WEB_KEYS[0]); i++) {
-        char body_copy[sizeof(body)];
-        memcpy(body_copy, body, sizeof(body_copy));
-        custom_mode_set_shortcut(WEB_KEYS[i], find_param(body_copy, WEB_KEY_IDS[i]));
+        char value[CUSTOM_SHORTCUT_MAX_LEN + 1];
+        find_param(body, WEB_KEY_IDS[i], value, sizeof(value));
+        custom_mode_set_shortcut(WEB_KEYS[i], value);
     }
+    free(body);
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_sendstr(req,

@@ -8,7 +8,7 @@
 #include "esp_log.h"
 
 #define BUTTON_ACTIVE_LEVEL 0
-#define BUTTON_DEBOUNCE_POLLS 3
+#define BUTTON_DEBOUNCE_POLLS 2
 
 typedef struct {
     button_key_t key;
